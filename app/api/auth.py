@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import or_, func
 from jose import jwt, JWTError
 
 from app.db.database import SessionLocal
@@ -28,22 +29,37 @@ def get_db():
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(data: LoginRequest, db: Session = Depends(get_db)):
+def login(
+        login_data: LoginRequest,
+        db: Session = Depends(get_db)
+):
+    login_identifier = login_data.email.strip().lower()
 
-    user = db.query(User).filter(User.email == data.email).first()
+    user = db.query(User).filter(
+        or_(
+            func.lower(User.email) == login_identifier,
+            func.lower(User.nickname) == login_identifier
+        )
+    ).first()
 
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials"
+        )
 
-    if not verify_password(data.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_password(login_data.password, user.password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials"
+        )
 
     access_token = create_access_token(
-        {"sub": str(user.id)}
+        data={"sub": str(user.id)}
     )
 
     refresh_token = create_refresh_token(
-        {"sub": str(user.id)}
+        data={"sub": str(user.id)}
     )
 
     return {

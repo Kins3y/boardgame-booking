@@ -13,6 +13,7 @@ from app.game.models.system_connection import SystemConnection
 from app.game.services.map_validator import validate_map
 from app.game.models.session_system import SessionSystem
 from app.game.models.session_building import SessionBuilding
+from app.game.schemas.start_system import StartSystemOptionResponse
 
 from app.models.user import User
 
@@ -446,3 +447,55 @@ def get_available_users_for_session(
         "session_id": session_id,
         "users": available_users
     }
+
+@router.get(
+    "/{session_id}/start-systems",
+    response_model=list[StartSystemOptionResponse]
+)
+def get_session_start_systems(
+        session_id: int,
+        db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    start_systems = db.query(StarSystem).filter(
+        StarSystem.map_id == game_session.map_id,
+        StarSystem.is_start == True
+    ).order_by(StarSystem.id.asc()).all()
+
+    players = db.query(SessionPlayer).filter(
+        SessionPlayer.session_id == session_id
+    ).all()
+
+    occupied_systems = {}
+
+    for player in players:
+        if player.start_system_id is not None:
+            occupied_systems[player.start_system_id] = player
+
+    response = []
+
+    for system in start_systems:
+        occupying_player = occupied_systems.get(system.id)
+
+        response.append(
+            StartSystemOptionResponse(
+                id=system.id,
+                name=system.name,
+                x=system.x,
+                y=system.y,
+                is_occupied=occupying_player is not None,
+                occupied_by_player_id=occupying_player.id if occupying_player else None,
+                occupied_by_faction=occupying_player.faction_name if occupying_player else None
+            )
+        )
+
+    return response
