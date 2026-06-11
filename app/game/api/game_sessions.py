@@ -6,7 +6,7 @@ from app.db.database import SessionLocal
 from app.game.models.game_map import GameMap
 from app.game.models.game_session import GameSession
 from app.game.models.session_player import SessionPlayer
-from app.game.schemas.game_session import GameSessionCreate
+from app.game.schemas.game_session import GameSessionCreate, GameSessionUpdateName
 from app.game.schemas.session_player import SessionPlayerCreate
 from app.game.models.star_system import StarSystem
 from app.game.models.system_connection import SystemConnection
@@ -65,6 +65,49 @@ def get_sessions(
         db: Session = Depends(get_db)
 ):
     return db.query(GameSession).all()
+
+@router.patch("/{session_id}/name")
+def update_session_name(
+        session_id: int,
+        data: GameSessionUpdateName,
+        db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "created":
+        raise HTTPException(
+            status_code=400,
+            detail="Only created sessions can be renamed"
+        )
+
+    session_name = data.name.strip()
+
+    if len(session_name) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Session name must be at least 3 characters long"
+        )
+
+    if len(session_name) > 60:
+        raise HTTPException(
+            status_code=400,
+            detail="Session name must be 60 characters or less"
+        )
+
+    game_session.name = session_name
+
+    db.commit()
+    db.refresh(game_session)
+
+    return game_session
 
 
 @router.post("/{session_id}/players")
