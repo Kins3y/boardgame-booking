@@ -32,6 +32,24 @@ def get_db():
     finally:
         db.close()
 
+BUILDING_DISPLAY_NAMES = {
+    "mine": "Mine",
+    "power_plant": "Power Plant",
+    "energy_plant": "Energy Plant",
+    "storage": "Supply Depot",
+    "research_center": "Research Center",
+    "barracks": "Barracks",
+    "spaceport": "Spaceport",
+    "orbital_defense": "Orbital Defense"
+}
+
+
+def get_building_display_name(building_type: str):
+    return BUILDING_DISPLAY_NAMES.get(
+        building_type,
+        building_type.replace("_", " ").title()
+    )
+
 
 @router.post("/")
 def create_session(
@@ -374,12 +392,17 @@ def get_full_session(
             buildings_response.append({
                 "id": building.id,
                 "building_type": building.building_type,
+                "building_name": get_building_display_name(building.building_type),
+                "system_id": session_system.system_id,
+                "system_name": star_system.name if star_system else None,
                 "owner_player_id": building.owner_player_id
             })
 
         systems_response.append({
             "system_id": session_system.system_id,
             "system_name": star_system.name if star_system else None,
+            "x": star_system.x if star_system else 0,
+            "y": star_system.y if star_system else 0,
             "owner_player_id": session_system.owner_player_id,
             "owner_faction": owner_faction,
             "buildings": buildings_response

@@ -43,6 +43,24 @@ BUILDING_SLOT_FIELD = {
     "storage": "storage_slots"
 }
 
+BUILDING_DISPLAY_NAMES = {
+    "mine": "Mine",
+    "power_plant": "Power Plant",
+    "energy_plant": "Energy Plant",
+    "storage": "Supply Depot",
+    "research_center": "Research Center",
+    "barracks": "Barracks",
+    "spaceport": "Spaceport",
+    "orbital_defense": "Orbital Defense"
+}
+
+
+def get_building_display_name(building_type: str):
+    return BUILDING_DISPLAY_NAMES.get(
+        building_type,
+        building_type.replace("_", " ").title()
+    )
+
 
 def get_db():
     db = SessionLocal()
@@ -167,12 +185,14 @@ def build_building(
     return {
         "message": "Building constructed",
         "building": {
-            "id": new_building.id,
-            "session_id": new_building.session_id,
-            "system_id": new_building.system_id,
-            "owner_player_id": new_building.owner_player_id,
-            "building_type": new_building.building_type
-        },
+    "id": new_building.id,
+    "session_id": new_building.session_id,
+    "system_id": new_building.system_id,
+    "system_name": star_system.name,
+    "owner_player_id": new_building.owner_player_id,
+    "building_type": new_building.building_type,
+    "building_name": get_building_display_name(new_building.building_type)
+},
         "player_resources": {
             "matter": player.matter,
             "energy": player.energy,
