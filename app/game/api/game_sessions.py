@@ -105,7 +105,7 @@ def add_player_to_session(
         .join(GameSession, SessionPlayer.session_id == GameSession.id)
         .filter(
             SessionPlayer.user_id == player.user_id,
-            GameSession.status.in_(["created", "started"])
+            GameSession.status == "started"
         )
         .first()
     )
@@ -199,6 +199,48 @@ def add_player_to_session(
     db.refresh(new_player)
 
     return new_player
+
+@router.delete("/{session_id}/players/{session_player_id}")
+def remove_player_from_session(
+        session_id: int,
+        session_player_id: int,
+        db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "created":
+        raise HTTPException(
+            status_code=400,
+            detail="Players can be removed only from created sessions"
+        )
+
+    session_player = db.query(SessionPlayer).filter(
+        SessionPlayer.id == session_player_id,
+        SessionPlayer.session_id == session_id
+    ).first()
+
+    if not session_player:
+        raise HTTPException(
+            status_code=404,
+            detail="Session player not found"
+        )
+
+    db.delete(session_player)
+    db.commit()
+
+    return {
+        "message": "Player removed from session",
+        "session_id": session_id,
+        "session_player_id": session_player_id
+    }
 
 
 @router.get("/{session_id}/full")
@@ -433,6 +475,53 @@ def finish_session(
         "players_count": len(players)
     }
 
+@router.delete("/{session_id}")
+def delete_created_session(
+        session_id: int,
+        db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "created":
+        raise HTTPException(
+            status_code=400,
+            detail="Only created sessions can be deleted"
+        )
+
+    db.query(SessionBuilding).filter(
+        SessionBuilding.session_id == session_id
+    ).delete(synchronize_session=False)
+
+    db.flush()
+
+    db.query(SessionSystem).filter(
+        SessionSystem.session_id == session_id
+    ).delete(synchronize_session=False)
+
+    db.flush()
+
+    db.query(SessionPlayer).filter(
+        SessionPlayer.session_id == session_id
+    ).delete(synchronize_session=False)
+
+    db.flush()
+
+    db.delete(game_session)
+    db.commit()
+
+    return {
+        "message": "Created session deleted",
+        "session_id": session_id
+    }
+
 @router.get("/overview")
 def get_sessions_overview(
         db: Session = Depends(get_db)
@@ -503,7 +592,7 @@ def get_available_users_for_session(
         db.query(SessionPlayer)
         .join(GameSession, SessionPlayer.session_id == GameSession.id)
         .filter(
-            GameSession.status.in_(["created", "started"])
+            GameSession.status == "started"
         )
         .all()
     )
