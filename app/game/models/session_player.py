@@ -11,6 +11,8 @@ class SessionPlayer(Base):
     session_id = Column(Integer, ForeignKey("game_sessions.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
+    civilization_id = Column(Integer, ForeignKey("civilizations.id"), nullable=True)
+
     faction_name = Column(String, nullable=False)
 
     matter = Column(Integer, default=10)

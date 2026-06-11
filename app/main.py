@@ -17,6 +17,7 @@ from app.game.api.game_sessions import router as game_session_router
 from app.game.models.session_system import SessionSystem
 from app.game.models.session_building import SessionBuilding
 from app.game.api.buildings import router as buildings_router
+from app.game.api.civilizations import router as civilizations_router
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -32,6 +33,8 @@ app.include_router(system_connection_router)
 app.include_router(game_map_router)
 app.include_router(game_session_router)
 app.include_router(buildings_router)
+app.include_router(civilizations_router)
+
 
 origins = [
     "http://localhost:5173",

@@ -14,6 +14,7 @@ from app.game.services.map_validator import validate_map
 from app.game.models.session_system import SessionSystem
 from app.game.models.session_building import SessionBuilding
 from app.game.schemas.start_system import StartSystemOptionResponse
+from app.game.models.civilization import Civilization
 
 from app.models.user import User
 
@@ -115,6 +116,34 @@ def add_player_to_session(
             detail="User is already in another active game session"
         )
 
+    if player.civilization_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Civilization is required"
+        )
+
+    civilization = db.query(Civilization).filter(
+        Civilization.id == player.civilization_id,
+        Civilization.is_active == True
+    ).first()
+
+    if not civilization:
+        raise HTTPException(
+            status_code=404,
+            detail="Civilization not found"
+        )
+
+    occupied_civilization = db.query(SessionPlayer).filter(
+        SessionPlayer.session_id == session_id,
+        SessionPlayer.civilization_id == player.civilization_id
+    ).first()
+
+    if occupied_civilization:
+        raise HTTPException(
+            status_code=409,
+            detail="Civilization is already selected by another player"
+        )
+
     if player.start_system_id is None:
         raise HTTPException(
             status_code=400,
@@ -157,7 +186,11 @@ def add_player_to_session(
     new_player = SessionPlayer(
         session_id=session_id,
         user_id=player.user_id,
+        civilization_id=player.civilization_id,
         faction_name=player.faction_name,
+        matter=civilization.starting_matter,
+        energy=civilization.starting_energy,
+        data=civilization.starting_data,
         start_system_id=player.start_system_id
     )
 
@@ -186,6 +219,43 @@ def get_full_session(
     players = db.query(SessionPlayer).filter(
         SessionPlayer.session_id == session_id
     ).all()
+
+    players_response = []
+
+    for player in players:
+        user = db.query(User).filter(
+            User.id == player.user_id
+        ).first()
+
+        civilization = None
+
+        if player.civilization_id is not None:
+            civilization = db.query(Civilization).filter(
+                Civilization.id == player.civilization_id
+            ).first()
+
+        start_system = None
+
+        if player.start_system_id is not None:
+            start_system = db.query(StarSystem).filter(
+                StarSystem.id == player.start_system_id
+            ).first()
+
+        players_response.append({
+            "id": player.id,
+            "session_id": player.session_id,
+            "user_id": player.user_id,
+            "nickname": user.nickname if user else None,
+            "email": user.email if user else None,
+            "civilization_id": player.civilization_id,
+            "civilization_name": civilization.name if civilization else None,
+            "faction_name": player.faction_name,
+            "matter": player.matter,
+            "energy": player.energy,
+            "data": player.data,
+            "start_system_id": player.start_system_id,
+            "start_system_name": start_system.name if start_system else None
+        })
 
     session_systems = db.query(SessionSystem).filter(
         SessionSystem.session_id == session_id
@@ -237,7 +307,7 @@ def get_full_session(
         "status": game_session.status,
         "current_round": game_session.current_round,
         "players_count": len(players),
-        "players": players,
+        "players": players_response,
         "systems": systems_response
     }
 
@@ -383,11 +453,20 @@ def get_sessions_overview(
                 User.id == player.user_id
             ).first()
 
+            civilization = None
+
+            if player.civilization_id is not None:
+                civilization = db.query(Civilization).filter(
+                    Civilization.id == player.civilization_id
+                ).first()
+
             players_response.append({
                 "session_player_id": player.id,
                 "user_id": player.user_id,
                 "nickname": user.nickname if user else None,
                 "email": user.email if user else None,
+                "civilization_id": player.civilization_id,
+                "civilization_name": civilization.name if civilization else None,
                 "faction_name": player.faction_name,
                 "start_system_id": player.start_system_id
             })
