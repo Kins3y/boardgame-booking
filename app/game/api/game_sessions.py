@@ -13,6 +13,7 @@ from app.game.models.system_connection import SystemConnection
 from app.game.services.map_validator import validate_map
 from app.game.models.session_system import SessionSystem
 from app.game.models.session_building import SessionBuilding
+from app.game.models.session_unit import SessionUnit
 from app.game.schemas.start_system import StartSystemOptionResponse
 from app.game.models.civilization import Civilization
 
@@ -32,6 +33,7 @@ def get_db():
     finally:
         db.close()
 
+
 BUILDING_DISPLAY_NAMES = {
     "mine": "Mine",
     "power_plant": "Power Plant",
@@ -43,12 +45,130 @@ BUILDING_DISPLAY_NAMES = {
     "orbital_defense": "Orbital Defense"
 }
 
+BUILDING_INCOME = {
+    "mine": {
+        "matter": 2,
+        "energy": 0,
+        "data": 0,
+        "food": 0
+    },
+    "power_plant": {
+        "matter": 0,
+        "energy": 2,
+        "data": 0,
+        "food": 0
+    },
+    "energy_plant": {
+        "matter": 0,
+        "energy": 2,
+        "data": 0,
+        "food": 0
+    },
+    "research_center": {
+        "matter": 0,
+        "energy": 0,
+        "data": 1,
+        "food": 0
+    },
+    "storage": {
+        "matter": 0,
+        "energy": 0,
+        "data": 0,
+        "food": 1
+    },
+    "barracks": {
+        "matter": 0,
+        "energy": 0,
+        "data": 0,
+        "food": 0
+    },
+    "spaceport": {
+        "matter": 0,
+        "energy": 0,
+        "data": 0,
+        "food": 0
+    },
+    "orbital_defense": {
+        "matter": 0,
+        "energy": 0,
+        "data": 0,
+        "food": 0
+    }
+}
+
+DEPLOYED_COLONY_INCOME = {
+    "matter": 2,
+    "energy": 2,
+    "data": 0,
+    "food": 0,
+}
+
+UNIT_ACTION_ENERGY_COST = 3
+
 
 def get_building_display_name(building_type: str):
     return BUILDING_DISPLAY_NAMES.get(
         building_type,
         building_type.replace("_", " ").title()
     )
+
+
+def calculate_buildings_income(buildings: list[SessionBuilding]):
+    income = {
+        "matter": 0,
+        "energy": 0,
+        "data": 0,
+        "food": 0
+    }
+
+    for building in buildings:
+        building_income = BUILDING_INCOME.get(
+            building.building_type,
+            {
+                "matter": 0,
+                "energy": 0,
+                "data": 0,
+                "food": 0
+            }
+        )
+
+        income["matter"] += building_income["matter"]
+        income["energy"] += building_income["energy"]
+        income["data"] += building_income["data"]
+        income["food"] += building_income["food"]
+
+    return income
+
+
+def calculate_deployed_colonies_income(units: list[SessionUnit]):
+    income = {
+        "matter": 0,
+        "energy": 0,
+        "data": 0,
+        "food": 0
+    }
+
+    for unit in units:
+        if unit.unit_type == "colony" and unit.state == "deployed":
+            income["matter"] += DEPLOYED_COLONY_INCOME["matter"]
+            income["energy"] += DEPLOYED_COLONY_INCOME["energy"]
+            income["data"] += DEPLOYED_COLONY_INCOME["data"]
+            income["food"] += DEPLOYED_COLONY_INCOME["food"]
+
+    return income
+
+
+def get_owned_system_ids(
+        session_id: int,
+        owner_player_id: int,
+        db: Session
+):
+    session_systems = db.query(SessionSystem).filter(
+        SessionSystem.session_id == session_id,
+        SessionSystem.owner_player_id == owner_player_id
+    ).all()
+
+    return [session_system.system_id for session_system in session_systems]
 
 
 @router.post("/")
@@ -83,6 +203,7 @@ def get_sessions(
         db: Session = Depends(get_db)
 ):
     return db.query(GameSession).all()
+
 
 @router.patch("/{session_id}/name")
 def update_session_name(
@@ -252,6 +373,7 @@ def add_player_to_session(
         matter=civilization.starting_matter,
         energy=civilization.starting_energy,
         data=civilization.starting_data,
+        food=civilization.starting_food,
         start_system_id=player.start_system_id
     )
 
@@ -260,6 +382,7 @@ def add_player_to_session(
     db.refresh(new_player)
 
     return new_player
+
 
 @router.delete("/{session_id}/players/{session_player_id}")
 def remove_player_from_session(
@@ -356,6 +479,7 @@ def get_full_session(
             "matter": player.matter,
             "energy": player.energy,
             "data": player.data,
+            "food": player.food,
             "start_system_id": player.start_system_id,
             "start_system_name": start_system.name if start_system else None
         })
@@ -398,6 +522,28 @@ def get_full_session(
                 "owner_player_id": building.owner_player_id
             })
 
+        units = db.query(SessionUnit).filter(
+            SessionUnit.session_id == session_id,
+            SessionUnit.system_id == session_system.system_id
+        ).all()
+
+        units_response = []
+
+        for unit in units:
+            units_response.append({
+                "id": unit.id,
+                "unit_type": unit.unit_type,
+                "state": unit.state,
+                "system_id": unit.system_id,
+                "owner_player_id": unit.owner_player_id,
+                "attack": unit.attack,
+                "defense": unit.defense,
+                "current_hp": unit.current_hp,
+                "max_hp": unit.max_hp,
+                "food_upkeep": unit.food_upkeep,
+                "is_foundation": unit.is_foundation
+            })
+
         systems_response.append({
             "system_id": session_system.system_id,
             "system_name": star_system.name if star_system else None,
@@ -405,7 +551,8 @@ def get_full_session(
             "y": star_system.y if star_system else 0,
             "owner_player_id": session_system.owner_player_id,
             "owner_faction": owner_faction,
-            "buildings": buildings_response
+            "buildings": buildings_response,
+            "units": units_response
         })
 
     return {
@@ -418,6 +565,7 @@ def get_full_session(
         "players": players_response,
         "systems": systems_response
     }
+
 
 @router.post("/{session_id}/start")
 def start_session(
@@ -489,6 +637,23 @@ def start_session(
 
         db.add(session_system)
 
+    for player in players:
+        starting_colony = SessionUnit(
+            session_id=session_id,
+            owner_player_id=player.id,
+            system_id=player.start_system_id,
+            unit_type="colony",
+            state="deployed",
+            attack=0,
+            defense=0,
+            current_hp=None,
+            max_hp=None,
+            food_upkeep=1,
+            is_foundation=True
+        )
+
+        db.add(starting_colony)
+
     game_session.status = "started"
 
     db.commit()
@@ -498,6 +663,319 @@ def start_session(
         "message": "Game session started",
         "session": game_session
     }
+
+
+@router.post("/{session_id}/next-round")
+def next_round(
+        session_id: int,
+        db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "started":
+        raise HTTPException(
+            status_code=400,
+            detail="Only started sessions can advance to the next round"
+        )
+
+    players = db.query(SessionPlayer).filter(
+        SessionPlayer.session_id == session_id
+    ).all()
+
+    if len(players) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Session has no players"
+        )
+
+    income_report = []
+
+    for player in players:
+        owned_system_ids = get_owned_system_ids(session_id, player.id, db)
+
+        if owned_system_ids:
+            buildings = db.query(SessionBuilding).filter(
+                SessionBuilding.session_id == session_id,
+                SessionBuilding.owner_player_id == player.id,
+                SessionBuilding.system_id.in_(owned_system_ids)
+            ).all()
+        else:
+            buildings = []
+
+        units = db.query(SessionUnit).filter(
+            SessionUnit.session_id == session_id,
+            SessionUnit.owner_player_id == player.id
+        ).all()
+
+        food_required = 0
+
+        for unit in units:
+            food_required += unit.food_upkeep
+
+        is_supplied = player.food >= food_required
+
+        food_spent = min(player.food, food_required)
+        player.food -= food_spent
+
+        buildings_income = calculate_buildings_income(buildings)
+
+        if is_supplied:
+            colonies_income = calculate_deployed_colonies_income(units)
+        else:
+            colonies_income = {
+                "matter": 0,
+                "energy": 0,
+                "data": 0,
+                "food": 0
+            }
+
+        total_income = {
+            "matter": buildings_income["matter"] + colonies_income["matter"],
+            "energy": buildings_income["energy"] + colonies_income["energy"],
+            "data": buildings_income["data"] + colonies_income["data"],
+            "food": buildings_income["food"] + colonies_income["food"]
+        }
+
+        player.matter += total_income["matter"]
+        player.energy += total_income["energy"]
+        player.data += total_income["data"]
+        player.food += total_income["food"]
+
+        income_report.append({
+            "session_player_id": player.id,
+            "faction_name": player.faction_name,
+            "is_supplied": is_supplied,
+            "food_required": food_required,
+            "food_spent": food_spent,
+            "buildings_income": buildings_income,
+            "colonies_income": colonies_income,
+            "total_income": total_income,
+            "units_count": len(units),
+            "buildings_count": len(buildings)
+        })
+
+    game_session.current_round += 1
+
+    db.commit()
+
+    return {
+        "message": "Next round started",
+        "session": get_full_session(session_id, db),
+        "income_report": income_report
+    }
+
+
+@router.post("/{session_id}/units/{unit_id}/pack-into-ark")
+def pack_colony_into_ark(
+        session_id: int,
+        unit_id: int,
+        db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "started":
+        raise HTTPException(
+            status_code=400,
+            detail="Only started sessions can use unit actions"
+        )
+
+    unit = db.query(SessionUnit).filter(
+        SessionUnit.id == unit_id,
+        SessionUnit.session_id == session_id
+    ).first()
+
+    if not unit:
+        raise HTTPException(
+            status_code=404,
+            detail="Unit not found"
+        )
+
+    if unit.unit_type != "colony":
+        raise HTTPException(
+            status_code=400,
+            detail="Only colony can be launched as ark"
+        )
+
+    if unit.state != "deployed":
+        raise HTTPException(
+            status_code=400,
+            detail="Only deployed colony can be launched as ark"
+        )
+
+    if unit.is_foundation:
+        raise HTTPException(
+            status_code=400,
+            detail="Foundation Colony cannot be launched as ark"
+        )
+
+    owner_player = db.query(SessionPlayer).filter(
+        SessionPlayer.id == unit.owner_player_id,
+        SessionPlayer.session_id == session_id
+    ).first()
+
+    if not owner_player:
+        raise HTTPException(
+            status_code=404,
+            detail="Unit owner not found"
+        )
+
+    if owner_player.energy < UNIT_ACTION_ENERGY_COST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough energy. Launch Ark costs {UNIT_ACTION_ENERGY_COST} energy"
+        )
+
+    owner_player.energy -= UNIT_ACTION_ENERGY_COST
+
+    unit.state = "ark"
+    unit.current_hp = 10
+    unit.max_hp = 10
+
+    other_deployed_colony = db.query(SessionUnit).filter(
+        SessionUnit.session_id == session_id,
+        SessionUnit.system_id == unit.system_id,
+        SessionUnit.owner_player_id == unit.owner_player_id,
+        SessionUnit.unit_type == "colony",
+        SessionUnit.state == "deployed",
+        SessionUnit.id != unit.id
+    ).first()
+
+    if not other_deployed_colony:
+        session_system = db.query(SessionSystem).filter(
+            SessionSystem.session_id == session_id,
+            SessionSystem.system_id == unit.system_id
+        ).first()
+
+        if session_system and session_system.owner_player_id == unit.owner_player_id:
+            session_system.owner_player_id = None
+
+    db.commit()
+
+    return {
+        "message": "Ark launched",
+        "action_cost": {
+            "energy": UNIT_ACTION_ENERGY_COST
+        },
+        "session": get_full_session(session_id, db)
+    }
+
+
+@router.post("/{session_id}/units/{unit_id}/colonize")
+def colonize_system_with_ark(
+        session_id: int,
+        unit_id: int,
+        db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "started":
+        raise HTTPException(
+            status_code=400,
+            detail="Only started sessions can use unit actions"
+        )
+
+    unit = db.query(SessionUnit).filter(
+        SessionUnit.id == unit_id,
+        SessionUnit.session_id == session_id
+    ).first()
+
+    if not unit:
+        raise HTTPException(
+            status_code=404,
+            detail="Unit not found"
+        )
+
+    if unit.unit_type != "colony":
+        raise HTTPException(
+            status_code=400,
+            detail="Only colony ark can colonize systems"
+        )
+
+    if unit.state != "ark":
+        raise HTTPException(
+            status_code=400,
+            detail="Only ark can colonize systems"
+        )
+
+    session_system = db.query(SessionSystem).filter(
+        SessionSystem.session_id == session_id,
+        SessionSystem.system_id == unit.system_id
+    ).first()
+
+    if not session_system:
+        raise HTTPException(
+            status_code=404,
+            detail="Session system not found"
+        )
+
+    if (
+        session_system.owner_player_id is not None
+        and session_system.owner_player_id != unit.owner_player_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="System is already colonized by another player"
+        )
+
+    owner_player = db.query(SessionPlayer).filter(
+        SessionPlayer.id == unit.owner_player_id,
+        SessionPlayer.session_id == session_id
+    ).first()
+
+    if not owner_player:
+        raise HTTPException(
+            status_code=404,
+            detail="Unit owner not found"
+        )
+
+    if owner_player.energy < UNIT_ACTION_ENERGY_COST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not enough energy. Colonize System costs {UNIT_ACTION_ENERGY_COST} energy"
+        )
+
+    owner_player.energy -= UNIT_ACTION_ENERGY_COST
+
+    unit.state = "deployed"
+    unit.current_hp = None
+    unit.max_hp = None
+
+    session_system.owner_player_id = unit.owner_player_id
+
+    db.commit()
+
+    return {
+        "message": "System colonized",
+        "action_cost": {
+            "energy": UNIT_ACTION_ENERGY_COST
+        },
+        "session": get_full_session(session_id, db)
+    }
+
 
 @router.post("/{session_id}/finish")
 def finish_session(
@@ -541,6 +1019,7 @@ def finish_session(
         "players_count": len(players)
     }
 
+
 @router.delete("/{session_id}")
 def delete_created_session(
         session_id: int,
@@ -561,6 +1040,12 @@ def delete_created_session(
             status_code=400,
             detail="Only created sessions can be deleted"
         )
+
+    db.query(SessionUnit).filter(
+        SessionUnit.session_id == session_id
+    ).delete(synchronize_session=False)
+
+    db.flush()
 
     db.query(SessionBuilding).filter(
         SessionBuilding.session_id == session_id
@@ -587,6 +1072,7 @@ def delete_created_session(
         "message": "Created session deleted",
         "session_id": session_id
     }
+
 
 @router.get("/overview")
 def get_sessions_overview(
@@ -681,6 +1167,7 @@ def get_available_users_for_session(
         "session_id": session_id,
         "users": available_users
     }
+
 
 @router.get(
     "/{session_id}/start-systems",

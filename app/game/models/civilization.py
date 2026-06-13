@@ -17,6 +17,7 @@ class Civilization(Base):
     starting_matter = Column(Integer, default=10)
     starting_energy = Column(Integer, default=5)
     starting_data = Column(Integer, default=1)
+    starting_food = Column(Integer, default=10)
 
     ability_name = Column(String(100), nullable=False)
     ability_description = Column(Text, nullable=False)

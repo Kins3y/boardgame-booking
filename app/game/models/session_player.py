@@ -18,5 +18,6 @@ class SessionPlayer(Base):
     matter = Column(Integer, default=10)
     energy = Column(Integer, default=5)
     data = Column(Integer, default=1)
+    food = Column(Integer, default=10)
 
     start_system_id = Column(Integer, ForeignKey("star_systems.id"), nullable=True)

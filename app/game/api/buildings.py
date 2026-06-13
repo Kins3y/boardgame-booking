@@ -170,6 +170,17 @@ def build_building(
     player.energy -= cost["energy"]
     player.data -= cost["data"]
 
+    BUILDING_LIMITS_PER_SYSTEM = {
+        "mine": 1,
+        "power_plant": 1,
+        "energy_plant": 1,
+        "storage": 2,
+        "research_center": 1,
+        "barracks": 1,
+        "spaceport": 1,
+        "orbital_defense": 1
+    }
+
     new_building = SessionBuilding(
         session_id=session_id,
         system_id=build_request.system_id,
