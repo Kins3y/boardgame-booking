@@ -405,3 +405,44 @@ def update_editor_map(
     ).all()
 
     return serialize_map(game_map, systems, connections)
+
+@router.delete("/{map_id}")
+def delete_editor_map(
+    map_id: int,
+    db: Session = Depends(get_db)
+):
+    game_map = db.query(GameMap).filter(
+        GameMap.id == map_id
+    ).first()
+
+    if not game_map:
+        raise HTTPException(
+            status_code=404,
+            detail="Map not found"
+        )
+
+    existing_session = db.query(GameSession).filter(
+        GameSession.map_id == map_id
+    ).first()
+
+    if existing_session:
+        raise HTTPException(
+            status_code=409,
+            detail="Map cannot be deleted because it is already used by a game session"
+        )
+
+    db.query(SystemConnection).filter(
+        SystemConnection.map_id == map_id
+    ).delete(synchronize_session=False)
+
+    db.query(StarSystem).filter(
+        StarSystem.map_id == map_id
+    ).delete(synchronize_session=False)
+
+    db.delete(game_map)
+    db.commit()
+
+    return {
+        "message": "Map deleted successfully",
+        "map_id": map_id
+    }
