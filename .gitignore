@@ -9,13 +9,18 @@ venv/
 
 # IDE
 .idea/
-idea/
+.vscode/
 
 # Mac
 .DS_Store
 
 # Environment
 .env
+.env.local
+.env.production
+
+# Keep examples
+!.env.example
 
 # Pytest
 .pytest_cache/
@@ -23,3 +28,6 @@ idea/
 # Coverage
 .coverage
 htmlcov/
+
+# Logs
+*.log
