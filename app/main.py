@@ -51,6 +51,14 @@ app = FastAPI(
     openapi_url=None if IS_PRODUCTION else "/openapi.json"
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(origins),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 Base.metadata.create_all(bind=engine)
 
 app.include_router(users_router)
@@ -61,23 +69,6 @@ app.include_router(game_map_router)
 app.include_router(game_session_router)
 app.include_router(buildings_router)
 app.include_router(civilizations_router)
-
-
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-
-origins = {
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    frontend_url
-}
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(origins),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 @app.get("/")
