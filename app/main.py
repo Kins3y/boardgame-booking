@@ -25,6 +25,7 @@ from app.game.api.game_maps import router as game_map_router
 from app.game.api.game_sessions import router as game_session_router
 from app.game.api.buildings import router as buildings_router
 from app.game.api.civilizations import router as civilizations_router
+from app.game.api.map_editor import router as map_editor_router
 
 
 load_dotenv()
@@ -69,6 +70,7 @@ app.include_router(game_map_router)
 app.include_router(game_session_router)
 app.include_router(buildings_router)
 app.include_router(civilizations_router)
+app.include_router(map_editor_router)
 
 
 @app.get("/")
