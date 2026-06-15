@@ -197,6 +197,61 @@ def advance_turn_or_start_next_round(
     start_action_phase(session, players)
 
 
+def require_current_player_for_action(
+    session: GameSession,
+    players: list[SessionPlayer],
+    player_id: int
+) -> SessionPlayer:
+    current_player = get_current_player(
+        players,
+        session.current_player_id
+    )
+
+    if not current_player:
+        raise HTTPException(
+            status_code=400,
+            detail="No current player is active"
+        )
+
+    if current_player.id != player_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only current player can perform actions"
+        )
+
+    if current_player.has_passed:
+        raise HTTPException(
+            status_code=400,
+            detail="Current player has already passed"
+        )
+
+    if current_player.command_points_left <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Current player has no command points left"
+        )
+
+    return current_player
+
+
+def consume_command_point_and_advance_turn(
+    session: GameSession,
+    players: list[SessionPlayer],
+    acting_player: SessionPlayer
+):
+    for index, player in enumerate(players):
+        if player.id == acting_player.id:
+            session.current_turn_index = index
+            break
+
+    acting_player.command_points_left -= 1
+
+    if acting_player.command_points_left <= 0:
+        acting_player.has_passed = True
+
+    advance_turn_or_start_next_round(session, players)
+
+
 def get_building_display_name(building_type: str):
     return BUILDING_DISPLAY_NAMES.get(
         building_type,
@@ -1137,13 +1192,20 @@ def pack_colony_into_ark(
             detail="Unit owner not found"
         )
 
-    if owner_player.energy < UNIT_ACTION_ENERGY_COST:
+    players = get_ordered_session_players(db, session_id)
+    acting_player = require_current_player_for_action(
+        session=game_session,
+        players=players,
+        player_id=owner_player.id
+    )
+
+    if acting_player.energy < UNIT_ACTION_ENERGY_COST:
         raise HTTPException(
             status_code=400,
             detail=f"Not enough energy. Launch Ark costs {UNIT_ACTION_ENERGY_COST} energy"
         )
 
-    owner_player.energy -= UNIT_ACTION_ENERGY_COST
+    acting_player.energy -= UNIT_ACTION_ENERGY_COST
 
     unit.state = "ark"
     unit.current_hp = 10
@@ -1169,6 +1231,12 @@ def pack_colony_into_ark(
             and session_system.owner_player_id == unit.owner_player_id
         ):
             session_system.owner_player_id = None
+
+    consume_command_point_and_advance_turn(
+        session=game_session,
+        players=players,
+        acting_player=acting_player
+    )
 
     db.commit()
 
@@ -1257,19 +1325,32 @@ def colonize_system_with_ark(
             detail="Unit owner not found"
         )
 
-    if owner_player.energy < UNIT_ACTION_ENERGY_COST:
+    players = get_ordered_session_players(db, session_id)
+    acting_player = require_current_player_for_action(
+        session=game_session,
+        players=players,
+        player_id=owner_player.id
+    )
+
+    if acting_player.energy < UNIT_ACTION_ENERGY_COST:
         raise HTTPException(
             status_code=400,
             detail=f"Not enough energy. Colonize System costs {UNIT_ACTION_ENERGY_COST} energy"
         )
 
-    owner_player.energy -= UNIT_ACTION_ENERGY_COST
+    acting_player.energy -= UNIT_ACTION_ENERGY_COST
 
     unit.state = "deployed"
     unit.current_hp = None
     unit.max_hp = None
 
     session_system.owner_player_id = unit.owner_player_id
+
+    consume_command_point_and_advance_turn(
+        session=game_session,
+        players=players,
+        acting_player=acting_player
+    )
 
     db.commit()
 
@@ -1484,4 +1565,3 @@ def get_session_start_systems(
         )
 
     return response
-
