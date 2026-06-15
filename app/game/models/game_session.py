@@ -14,3 +14,26 @@ class GameSession(Base):
 
     status = Column(String, default="created")
     current_round = Column(Integer, default=1)
+
+    play_mode = Column(
+        String,
+        nullable=False,
+        default="hotseat"
+    )
+
+    current_player_id = Column(
+        Integer,
+        nullable=True
+    )
+
+    current_turn_index = Column(
+        Integer,
+        nullable=False,
+        default=0
+    )
+
+    round_phase = Column(
+        String,
+        nullable=False,
+        default="setup"
+    )

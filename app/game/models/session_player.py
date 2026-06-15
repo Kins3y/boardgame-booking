@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey, Boolean
 
 from app.db.database import Base
 
@@ -21,3 +21,15 @@ class SessionPlayer(Base):
     food = Column(Integer, default=10)
 
     start_system_id = Column(Integer, ForeignKey("star_systems.id"), nullable=True)
+
+    command_points_left = Column(
+        Integer,
+        nullable=False,
+        default=3
+    )
+
+    has_passed = Column(
+        Boolean,
+        nullable=False,
+        default=False
+    )
