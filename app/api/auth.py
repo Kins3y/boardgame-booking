@@ -116,9 +116,14 @@ def refresh_token(
 
 @router.get("/me")
 def me(current_user: User = Depends(get_current_user)):
+    admin_badge = None
+
+    if current_user.role == "super_admin":
+        admin_badge = "SUPER ADMIN"
+
     return {
         "id": current_user.id,
         "email": current_user.email,
         "nickname": current_user.nickname,
-        "role": current_user.role
+        "admin_badge": admin_badge
     }

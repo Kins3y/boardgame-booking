@@ -30,7 +30,8 @@ def get_db():
 def serialize_map(
     game_map: GameMap,
     systems: list[StarSystem],
-    connections: list[SystemConnection]
+    connections: list[SystemConnection],
+    current_user: User
 ):
     return {
         "id": game_map.id,
@@ -39,8 +40,10 @@ def serialize_map(
         "grid_width": game_map.grid_width,
         "grid_height": game_map.grid_height,
         "is_active": game_map.is_active,
-        "created_by_user_id": game_map.created_by_user_id,
         "visibility": game_map.visibility,
+        "is_owned_by_current_user": game_map.created_by_user_id == current_user.id,
+        "can_edit": can_user_modify_map(game_map, current_user),
+        "can_delete": can_user_modify_map(game_map, current_user),
         "systems": [
             {
                 "id": system.id,
@@ -365,8 +368,10 @@ def get_editor_maps(
             "grid_width": game_map.grid_width,
             "grid_height": game_map.grid_height,
             "is_active": game_map.is_active,
-            "created_by_user_id": game_map.created_by_user_id,
             "visibility": game_map.visibility,
+            "is_owned_by_current_user": game_map.created_by_user_id == current_user.id,
+            "can_edit": can_user_modify_map(game_map, current_user),
+            "can_delete": can_user_modify_map(game_map, current_user),
         }
         for game_map in maps
     ]
@@ -422,7 +427,7 @@ def create_editor_map(
         SystemConnection.map_id == new_map.id
     ).all()
 
-    return serialize_map(new_map, systems, connections)
+    return serialize_map(new_map, systems, connections, current_user)
 
 
 @router.get("/{map_id}")
@@ -451,7 +456,7 @@ def get_editor_map(
         SystemConnection.map_id == map_id
     ).all()
 
-    return serialize_map(game_map, systems, connections)
+    return serialize_map(game_map, systems, connections, current_user)
 
 
 @router.put("/{map_id}")
