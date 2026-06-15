@@ -3,8 +3,10 @@ from pydantic import BaseModel, EmailStr
 
 class UserCreate(BaseModel):
     email: EmailStr
+    nickname: str
     password: str
-    nickname: str | None = None
+    password_confirm: str
+
 
 class UserResponse(BaseModel):
     id: int
@@ -13,3 +15,13 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class UserNicknameUpdate(BaseModel):
+    nickname: str
+
+
+class UserPasswordUpdate(BaseModel):
+    old_password: str
+    new_password: str
+    new_password_confirm: str
