@@ -1,4 +1,9 @@
-from sqlalchemy import Boolean, Column, DateTime, Integer, String
+from sqlalchemy import Boolean
+from sqlalchemy import Column
+from sqlalchemy import DateTime
+from sqlalchemy import ForeignKey
+from sqlalchemy import Integer
+from sqlalchemy import String
 from sqlalchemy.sql import func
 
 from app.db.database import Base
@@ -8,6 +13,7 @@ class GameMap(Base):
     __tablename__ = "game_maps"
 
     id = Column(Integer, primary_key=True, index=True)
+
     name = Column(String, nullable=False)
 
     players_count = Column(Integer, nullable=False, default=2)
@@ -16,6 +22,19 @@ class GameMap(Base):
     grid_height = Column(Integer, nullable=False, default=20)
 
     is_active = Column(Boolean, nullable=False, default=True)
+
+    created_by_user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=True
+    )
+
+    # private | public | official
+    visibility = Column(
+        String,
+        nullable=False,
+        default="private"
+    )
 
     created_at = Column(
         DateTime(timezone=True),

@@ -1,5 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
+
+from app.models.user import User
+from app.services.security import get_current_user
 
 from app.db.database import SessionLocal
 from app.game.models.game_map import GameMap
@@ -35,6 +39,8 @@ def serialize_map(
         "grid_width": game_map.grid_width,
         "grid_height": game_map.grid_height,
         "is_active": game_map.is_active,
+        "created_by_user_id": game_map.created_by_user_id,
+        "visibility": game_map.visibility,
         "systems": [
             {
                 "id": system.id,
@@ -65,6 +71,79 @@ def serialize_map(
         ],
     }
 
+
+def is_super_admin(user: User) -> bool:
+    return user.role == "super_admin"
+
+
+def can_user_access_map(
+    game_map: GameMap,
+    user: User
+) -> bool:
+    if is_super_admin(user):
+        return True
+
+    if game_map.visibility in ["public", "official"]:
+        return True
+
+    return game_map.created_by_user_id == user.id
+
+
+def can_user_modify_map(
+    game_map: GameMap,
+    user: User
+) -> bool:
+    if is_super_admin(user):
+        return True
+
+    if game_map.visibility == "official":
+        return False
+
+    return game_map.created_by_user_id == user.id
+
+
+def assert_user_can_access_map(
+    game_map: GameMap,
+    user: User
+):
+    if not can_user_access_map(game_map, user):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this map"
+        )
+
+
+def assert_user_can_modify_map(
+    game_map: GameMap,
+    user: User
+):
+    if not can_user_modify_map(game_map, user):
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot modify this map"
+        )
+
+
+def normalize_visibility(
+    requested_visibility: str | None,
+    current_user: User
+) -> str:
+    if not requested_visibility:
+        return "private"
+
+    if requested_visibility not in ["private", "public", "official"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid map visibility"
+        )
+
+    if requested_visibility == "official" and not is_super_admin(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only super admin can create official maps"
+        )
+
+    return requested_visibility
 
 def validate_editor_payload(payload: MapEditorSaveRequest):
     systems = payload.systems
@@ -263,9 +342,34 @@ def create_systems_and_connections(
 
 @router.get("/")
 def get_editor_maps(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
-    maps = db.query(GameMap).order_by(GameMap.id.desc()).all()
+    query = db.query(GameMap)
+
+    if not is_super_admin(current_user):
+        query = query.filter(
+            or_(
+                GameMap.created_by_user_id == current_user.id,
+                GameMap.visibility.in_(["public", "official"])
+            )
+        )
+
+    maps = query.order_by(GameMap.id.desc()).all()
+
+    return [
+        {
+            "id": game_map.id,
+            "name": game_map.name,
+            "players_count": game_map.players_count,
+            "grid_width": game_map.grid_width,
+            "grid_height": game_map.grid_height,
+            "is_active": game_map.is_active,
+            "created_by_user_id": game_map.created_by_user_id,
+            "visibility": game_map.visibility,
+        }
+        for game_map in maps
+    ]
 
     return [
         {
@@ -283,7 +387,8 @@ def get_editor_maps(
 @router.post("/")
 def create_editor_map(
     payload: MapEditorSaveRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     validate_editor_payload(payload)
 
@@ -293,6 +398,8 @@ def create_editor_map(
         grid_width=payload.grid_width,
         grid_height=payload.grid_height,
         is_active=True,
+        created_by_user_id=current_user.id,
+        visibility="private",
     )
 
     db.add(new_map)
@@ -321,7 +428,8 @@ def create_editor_map(
 @router.get("/{map_id}")
 def get_editor_map(
     map_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     game_map = db.query(GameMap).filter(
         GameMap.id == map_id
@@ -332,6 +440,8 @@ def get_editor_map(
             status_code=404,
             detail="Map not found"
         )
+
+    assert_user_can_access_map(game_map, current_user)
 
     systems = db.query(StarSystem).filter(
         StarSystem.map_id == map_id
@@ -348,7 +458,8 @@ def get_editor_map(
 def update_editor_map(
     map_id: int,
     payload: MapEditorSaveRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     validate_editor_payload(payload)
 
@@ -361,6 +472,8 @@ def update_editor_map(
             status_code=404,
             detail="Map not found"
         )
+
+    assert_user_can_modify_map(game_map, current_user)
 
     existing_session = db.query(GameSession).filter(
         GameSession.map_id == map_id
@@ -409,7 +522,8 @@ def update_editor_map(
 @router.delete("/{map_id}")
 def delete_editor_map(
     map_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     game_map = db.query(GameMap).filter(
         GameMap.id == map_id
@@ -420,6 +534,8 @@ def delete_editor_map(
             status_code=404,
             detail="Map not found"
         )
+
+    assert_user_can_modify_map(game_map, current_user)
 
     existing_session = db.query(GameSession).filter(
         GameSession.map_id == map_id
