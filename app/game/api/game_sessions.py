@@ -9,6 +9,7 @@ from app.game.models.session_building import SessionBuilding
 from app.game.models.session_player import SessionPlayer
 from app.game.models.session_system import SessionSystem
 from app.game.models.session_unit import SessionUnit
+from app.game.models.session_fleet import SessionFleet
 from app.game.models.star_system import StarSystem
 from app.game.models.system_connection import SystemConnection
 from app.game.schemas.game_session import GameSessionCreate
@@ -17,6 +18,7 @@ from app.game.schemas.session_player import SessionPlayerCreate
 from app.game.schemas.start_system import StartSystemOptionResponse
 from app.game.services.map_validator import validate_map
 from app.models.user import User
+
 
 
 COMMAND_POINTS_PER_ROUND = 3
@@ -29,6 +31,19 @@ DEPLOYED_COLONY_INCOME = {
 }
 
 UNIT_ACTION_ENERGY_COST = 3
+COLONY_BUILDING_TYPE = "colony"
+
+FLEETS_PER_PLAYER = 4
+UNITS_PER_FLEET = 5
+
+UNIT_FORMATION_WEIGHTS = {
+    "scout": 10,
+    "marine": 20,
+    "frigate": 40,
+    "colony": 80,
+    "ark": 90,
+    "cruiser": 100,
+}
 
 
 router = APIRouter(
@@ -54,7 +69,8 @@ BUILDING_DISPLAY_NAMES = {
     "research_center": "Research Center",
     "barracks": "Barracks",
     "spaceport": "Spaceport",
-    "orbital_defense": "Orbital Defense"
+    "orbital_defense": "Orbital Defense",
+    "colony": "Colony"
 }
 
 
@@ -164,11 +180,182 @@ def find_next_active_player_index(
     return None
 
 
+def get_unit_formation_weight(unit_type: str) -> int:
+    return UNIT_FORMATION_WEIGHTS.get(unit_type, 50)
+
+
+def reset_fleets_for_new_round(
+    db: Session,
+    session_id: int
+):
+    fleets = db.query(SessionFleet).filter(
+        SessionFleet.session_id == session_id
+    ).all()
+
+    for fleet in fleets:
+        fleet.has_acted_this_round = False
+        fleet.is_defensive = False
+
+def count_fleet_units(
+    db: Session,
+    session_id: int,
+    fleet_id: int
+) -> int:
+    return db.query(SessionUnit).filter(
+        SessionUnit.session_id == session_id,
+        SessionUnit.fleet_id == fleet_id
+    ).count()
+
+
+def get_next_available_unit_slot(
+    db: Session,
+    session_id: int,
+    fleet_id: int
+) -> int:
+    units = db.query(SessionUnit).filter(
+        SessionUnit.session_id == session_id,
+        SessionUnit.fleet_id == fleet_id
+    ).all()
+
+    used_slots = {
+        unit.slot_index
+        for unit in units
+        if unit.slot_index is not None
+    }
+
+    for slot_index in range(1, UNITS_PER_FLEET + 1):
+        if slot_index not in used_slots:
+            return slot_index
+
+    raise HTTPException(
+        status_code=400,
+        detail="Fleet has no available unit slots"
+    )
+
+
+def get_next_fleet_number(
+    db: Session,
+    session_id: int,
+    owner_player_id: int
+) -> int:
+    active_fleets = db.query(SessionFleet).filter(
+        SessionFleet.session_id == session_id,
+        SessionFleet.owner_player_id == owner_player_id
+    ).all()
+
+    used_numbers = {fleet.fleet_number for fleet in active_fleets}
+
+    for fleet_number in range(1, FLEETS_PER_PLAYER + 1):
+        if fleet_number not in used_numbers:
+            return fleet_number
+
+    raise HTTPException(
+        status_code=400,
+        detail="Player has no available fleet slots"
+    )
+
+
+def get_next_built_order(
+    db: Session,
+    session_id: int,
+    owner_player_id: int
+) -> int:
+    last_unit = db.query(SessionUnit).filter(
+        SessionUnit.session_id == session_id,
+        SessionUnit.owner_player_id == owner_player_id
+    ).order_by(SessionUnit.built_order.desc()).first()
+
+    if not last_unit:
+        return 1
+
+    return last_unit.built_order + 1
+
+
+def find_or_create_fleet_for_new_unit(
+    db: Session,
+    session_id: int,
+    owner_player_id: int,
+    system_id: int
+) -> SessionFleet:
+    fleets_in_system = db.query(SessionFleet).filter(
+        SessionFleet.session_id == session_id,
+        SessionFleet.owner_player_id == owner_player_id,
+        SessionFleet.system_id == system_id
+    ).order_by(SessionFleet.fleet_number.asc()).all()
+
+    for fleet in fleets_in_system:
+        if count_fleet_units(db, session_id, fleet.id) < UNITS_PER_FLEET:
+            return fleet
+
+    active_fleets_count = db.query(SessionFleet).filter(
+        SessionFleet.session_id == session_id,
+        SessionFleet.owner_player_id == owner_player_id
+    ).count()
+
+    if active_fleets_count >= FLEETS_PER_PLAYER:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No available fleet capacity in this system. "
+                "Move an existing fleet here or free a fleet slot first."
+            )
+        )
+
+    fleet_number = get_next_fleet_number(
+        db=db,
+        session_id=session_id,
+        owner_player_id=owner_player_id
+    )
+
+    fleet = SessionFleet(
+        session_id=session_id,
+        owner_player_id=owner_player_id,
+        system_id=system_id,
+        fleet_number=fleet_number,
+        name=f"Fleet {fleet_number}"
+    )
+
+    db.add(fleet)
+    db.flush()
+
+    return fleet
+
+
+def delete_fleet_if_empty(
+    db: Session,
+    session_id: int,
+    fleet_id: int | None
+):
+    if fleet_id is None:
+        return
+
+    units_count = count_fleet_units(
+        db=db,
+        session_id=session_id,
+        fleet_id=fleet_id
+    )
+
+    if units_count > 0:
+        return
+
+    fleet = db.query(SessionFleet).filter(
+        SessionFleet.id == fleet_id,
+        SessionFleet.session_id == session_id
+    ).first()
+
+    if fleet:
+        db.delete(fleet)
+
+
 def start_action_phase(
     session: GameSession,
-    players: list[SessionPlayer]
+    players: list[SessionPlayer],
+    db: Session | None = None
 ):
     reset_players_for_new_round(players)
+
+    if db is not None:
+        reset_fleets_for_new_round(db, session.id)
 
     session.round_phase = "action"
     session.current_turn_index = 0
@@ -181,7 +368,8 @@ def start_action_phase(
 
 def advance_turn_or_start_next_round(
     session: GameSession,
-    players: list[SessionPlayer]
+    players: list[SessionPlayer],
+    db: Session | None = None
 ):
     next_player_index = find_next_active_player_index(
         players=players,
@@ -193,8 +381,15 @@ def advance_turn_or_start_next_round(
         session.current_player_id = players[next_player_index].id
         return
 
+    if db is not None:
+        build_income_report_and_apply_income(
+            session_id=session.id,
+            players=players,
+            db=db
+        )
+
     session.current_round += 1
-    start_action_phase(session, players)
+    start_action_phase(session, players, db)
 
 
 def require_current_player_for_action(
@@ -237,7 +432,8 @@ def require_current_player_for_action(
 def consume_command_point_and_advance_turn(
     session: GameSession,
     players: list[SessionPlayer],
-    acting_player: SessionPlayer
+    acting_player: SessionPlayer,
+    db: Session | None = None
 ):
     for index, player in enumerate(players):
         if player.id == acting_player.id:
@@ -249,7 +445,7 @@ def consume_command_point_and_advance_turn(
     if acting_player.command_points_left <= 0:
         acting_player.has_passed = True
 
-    advance_turn_or_start_next_round(session, players)
+    advance_turn_or_start_next_round(session, players, db)
 
 
 def get_building_display_name(building_type: str):
@@ -286,7 +482,7 @@ def calculate_buildings_income(buildings: list[SessionBuilding]):
     return income
 
 
-def calculate_deployed_colonies_income(units: list[SessionUnit]):
+def calculate_colony_buildings_income(buildings: list[SessionBuilding]):
     income = {
         "matter": 0,
         "energy": 0,
@@ -294,8 +490,8 @@ def calculate_deployed_colonies_income(units: list[SessionUnit]):
         "food": 0
     }
 
-    for unit in units:
-        if unit.unit_type == "colony" and unit.state == "deployed":
+    for building in buildings:
+        if building.building_type == COLONY_BUILDING_TYPE:
             income["matter"] += DEPLOYED_COLONY_INCOME["matter"]
             income["energy"] += DEPLOYED_COLONY_INCOME["energy"]
             income["data"] += DEPLOYED_COLONY_INCOME["data"]
@@ -351,10 +547,22 @@ def build_income_report_and_apply_income(
         food_spent = min(player.food, food_required)
         player.food -= food_spent
 
-        buildings_income = calculate_buildings_income(buildings)
+        non_colony_buildings = [
+            building
+            for building in buildings
+            if building.building_type != COLONY_BUILDING_TYPE
+        ]
+
+        colony_buildings = [
+            building
+            for building in buildings
+            if building.building_type == COLONY_BUILDING_TYPE
+        ]
+
+        buildings_income = calculate_buildings_income(non_colony_buildings)
 
         if is_supplied:
-            colonies_income = calculate_deployed_colonies_income(units)
+            colonies_income = calculate_colony_buildings_income(colony_buildings)
         else:
             colonies_income = {
                 "matter": 0,
@@ -385,7 +593,8 @@ def build_income_report_and_apply_income(
             "colonies_income": colonies_income,
             "total_income": total_income,
             "units_count": len(units),
-            "buildings_count": len(buildings)
+            "buildings_count": len(buildings),
+            "colonies_count": len(colony_buildings)
         })
 
     return income_report
@@ -747,6 +956,62 @@ def get_full_session(
                 StarSystem.id == player.start_system_id
             ).first()
 
+        fleets = db.query(SessionFleet).filter(
+            SessionFleet.session_id == session_id,
+            SessionFleet.owner_player_id == player.id
+        ).order_by(SessionFleet.fleet_number.asc()).all()
+
+        fleets_response = []
+
+        for fleet in fleets:
+            fleet_system = db.query(StarSystem).filter(
+                StarSystem.id == fleet.system_id
+            ).first()
+
+            fleet_units = db.query(SessionUnit).filter(
+                SessionUnit.session_id == session_id,
+                SessionUnit.fleet_id == fleet.id
+            ).order_by(
+                SessionUnit.formation_weight.asc(),
+                SessionUnit.built_order.asc(),
+                SessionUnit.id.asc()
+            ).all()
+
+            units_response = []
+
+            for unit in fleet_units:
+                units_response.append({
+                    "id": unit.id,
+                    "unit_type": unit.unit_type,
+                    "state": unit.state,
+                    "system_id": unit.system_id,
+                    "fleet_id": unit.fleet_id,
+                    "slot_index": unit.slot_index,
+                    "owner_player_id": unit.owner_player_id,
+                    "attack": unit.attack,
+                    "defense": unit.defense,
+                    "current_hp": unit.current_hp,
+                    "max_hp": unit.max_hp,
+                    "food_upkeep": unit.food_upkeep,
+                    "is_foundation": unit.is_foundation,
+                    "is_combat": unit.is_combat,
+                    "formation_weight": unit.formation_weight,
+                    "built_order": unit.built_order
+                })
+
+            fleets_response.append({
+                "id": fleet.id,
+                "session_id": fleet.session_id,
+                "owner_player_id": fleet.owner_player_id,
+                "system_id": fleet.system_id,
+                "system_name": fleet_system.name if fleet_system else None,
+                "fleet_number": fleet.fleet_number,
+                "name": fleet.name,
+                "is_defensive": fleet.is_defensive,
+                "has_acted_this_round": fleet.has_acted_this_round,
+                "units": units_response
+            })
+
         players_response.append({
             "id": player.id,
             "session_id": player.session_id,
@@ -763,7 +1028,8 @@ def get_full_session(
             "start_system_id": player.start_system_id,
             "start_system_name": start_system.name if start_system else None,
             "command_points_left": player.command_points_left,
-            "has_passed": player.has_passed
+            "has_passed": player.has_passed,
+            "fleets": fleets_response
         })
 
     session_systems = db.query(SessionSystem).filter(
@@ -807,6 +1073,10 @@ def get_full_session(
         units = db.query(SessionUnit).filter(
             SessionUnit.session_id == session_id,
             SessionUnit.system_id == session_system.system_id
+        ).order_by(
+            SessionUnit.formation_weight.asc(),
+            SessionUnit.built_order.asc(),
+            SessionUnit.id.asc()
         ).all()
 
         units_response = []
@@ -817,13 +1087,18 @@ def get_full_session(
                 "unit_type": unit.unit_type,
                 "state": unit.state,
                 "system_id": unit.system_id,
+                "fleet_id": unit.fleet_id,
+                "slot_index": unit.slot_index,
                 "owner_player_id": unit.owner_player_id,
                 "attack": unit.attack,
                 "defense": unit.defense,
                 "current_hp": unit.current_hp,
                 "max_hp": unit.max_hp,
                 "food_upkeep": unit.food_upkeep,
-                "is_foundation": unit.is_foundation
+                "is_foundation": unit.is_foundation,
+                "is_combat": unit.is_combat,
+                "formation_weight": unit.formation_weight,
+                "built_order": unit.built_order
             })
 
         systems_response.append({
@@ -922,18 +1197,11 @@ def start_session(
         db.add(session_system)
 
     for player in players:
-        starting_colony = SessionUnit(
+        starting_colony = SessionBuilding(
             session_id=session_id,
             owner_player_id=player.id,
             system_id=player.start_system_id,
-            unit_type="colony",
-            state="deployed",
-            attack=0,
-            defense=0,
-            current_hp=None,
-            max_hp=None,
-            food_upkeep=1,
-            is_foundation=True
+            building_type=COLONY_BUILDING_TYPE
         )
 
         db.add(starting_colony)
@@ -942,7 +1210,7 @@ def start_session(
     game_session.current_round = 1
     game_session.play_mode = "hotseat"
 
-    start_action_phase(game_session, players)
+    start_action_phase(game_session, players, db)
 
     db.commit()
     db.refresh(game_session)
@@ -989,7 +1257,7 @@ def next_round(
     )
 
     game_session.current_round += 1
-    start_action_phase(game_session, players)
+    start_action_phase(game_session, players, db)
 
     db.commit()
 
@@ -1054,7 +1322,7 @@ def end_current_turn(
 
     if current_player.command_points_left <= 0:
         current_player.has_passed = True
-        advance_turn_or_start_next_round(game_session, players)
+        advance_turn_or_start_next_round(game_session, players, db)
 
         db.commit()
         db.refresh(game_session)
@@ -1069,7 +1337,7 @@ def end_current_turn(
     if current_player.command_points_left <= 0:
         current_player.has_passed = True
 
-    advance_turn_or_start_next_round(game_session, players)
+    advance_turn_or_start_next_round(game_session, players, db)
 
     db.commit()
     db.refresh(game_session)
@@ -1119,7 +1387,7 @@ def pass_current_player(
         game_session.current_player_id = players[0].id
     else:
         current_player.has_passed = True
-        advance_turn_or_start_next_round(game_session, players)
+        advance_turn_or_start_next_round(game_session, players, db)
 
     db.commit()
     db.refresh(game_session)
@@ -1130,10 +1398,10 @@ def pass_current_player(
     }
 
 
-@router.post("/{session_id}/units/{unit_id}/pack-into-ark")
-def pack_colony_into_ark(
+@router.post("/{session_id}/buildings/{building_id}/pack-into-ark")
+def pack_colony_building_into_ark(
     session_id: int,
-    unit_id: int,
+    building_id: int,
     db: Session = Depends(get_db)
 ):
     game_session = db.query(GameSession).filter(
@@ -1149,47 +1417,35 @@ def pack_colony_into_ark(
     if game_session.status != "started":
         raise HTTPException(
             status_code=400,
-            detail="Only started sessions can use unit actions"
+            detail="Only started sessions can use colony actions"
         )
 
-    unit = db.query(SessionUnit).filter(
-        SessionUnit.id == unit_id,
-        SessionUnit.session_id == session_id
+    colony = db.query(SessionBuilding).filter(
+        SessionBuilding.id == building_id,
+        SessionBuilding.session_id == session_id
     ).first()
 
-    if not unit:
+    if not colony:
         raise HTTPException(
             status_code=404,
-            detail="Unit not found"
+            detail="Colony building not found"
         )
 
-    if unit.unit_type != "colony":
+    if colony.building_type != COLONY_BUILDING_TYPE:
         raise HTTPException(
             status_code=400,
-            detail="Only colony can be launched as ark"
-        )
-
-    if unit.state != "deployed":
-        raise HTTPException(
-            status_code=400,
-            detail="Only deployed colony can be launched as ark"
-        )
-
-    if unit.is_foundation:
-        raise HTTPException(
-            status_code=400,
-            detail="Foundation Colony cannot be launched as ark"
+            detail="Only Colony building can be packed into Ark"
         )
 
     owner_player = db.query(SessionPlayer).filter(
-        SessionPlayer.id == unit.owner_player_id,
+        SessionPlayer.id == colony.owner_player_id,
         SessionPlayer.session_id == session_id
     ).first()
 
     if not owner_player:
         raise HTTPException(
             status_code=404,
-            detail="Unit owner not found"
+            detail="Colony owner not found"
         )
 
     players = get_ordered_session_players(db, session_id)
@@ -1199,54 +1455,120 @@ def pack_colony_into_ark(
         player_id=owner_player.id
     )
 
+    player_colonies_count = db.query(SessionBuilding).filter(
+        SessionBuilding.session_id == session_id,
+        SessionBuilding.owner_player_id == owner_player.id,
+        SessionBuilding.building_type == COLONY_BUILDING_TYPE
+    ).count()
+
+    if player_colonies_count <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Player cannot pack the last Colony into Ark"
+        )
+
     if acting_player.energy < UNIT_ACTION_ENERGY_COST:
         raise HTTPException(
             status_code=400,
-            detail=f"Not enough energy. Launch Ark costs {UNIT_ACTION_ENERGY_COST} energy"
+            detail=f"Not enough energy. Pack into Ark costs {UNIT_ACTION_ENERGY_COST} energy"
         )
+
+    fleet = find_or_create_fleet_for_new_unit(
+        db=db,
+        session_id=session_id,
+        owner_player_id=owner_player.id,
+        system_id=colony.system_id
+    )
+
+    slot_index = get_next_available_unit_slot(
+        db=db,
+        session_id=session_id,
+        fleet_id=fleet.id
+    )
+
+    built_order = get_next_built_order(
+        db=db,
+        session_id=session_id,
+        owner_player_id=owner_player.id
+    )
 
     acting_player.energy -= UNIT_ACTION_ENERGY_COST
 
-    unit.state = "ark"
-    unit.current_hp = 10
-    unit.max_hp = 10
+    ark = SessionUnit(
+        session_id=session_id,
+        owner_player_id=owner_player.id,
+        system_id=colony.system_id,
+        fleet_id=fleet.id,
+        slot_index=slot_index,
+        unit_type="ark",
+        state="ark",
+        attack=0,
+        defense=1,
+        current_hp=10,
+        max_hp=10,
+        food_upkeep=1,
+        is_foundation=False,
+        formation_weight=get_unit_formation_weight("ark"),
+        built_order=built_order,
+        is_combat=False
+    )
 
-    other_deployed_colony = db.query(SessionUnit).filter(
-        SessionUnit.session_id == session_id,
-        SessionUnit.system_id == unit.system_id,
-        SessionUnit.owner_player_id == unit.owner_player_id,
-        SessionUnit.unit_type == "colony",
-        SessionUnit.state == "deployed",
-        SessionUnit.id != unit.id
+    colony_system_id = colony.system_id
+
+    db.add(ark)
+    db.delete(colony)
+    db.flush()
+
+    remaining_colony_in_system = db.query(SessionBuilding).filter(
+        SessionBuilding.session_id == session_id,
+        SessionBuilding.owner_player_id == owner_player.id,
+        SessionBuilding.system_id == colony_system_id,
+        SessionBuilding.building_type == COLONY_BUILDING_TYPE
     ).first()
 
-    if not other_deployed_colony:
+    if not remaining_colony_in_system:
         session_system = db.query(SessionSystem).filter(
             SessionSystem.session_id == session_id,
-            SessionSystem.system_id == unit.system_id
+            SessionSystem.system_id == colony_system_id
         ).first()
 
         if (
             session_system
-            and session_system.owner_player_id == unit.owner_player_id
+            and session_system.owner_player_id == owner_player.id
         ):
             session_system.owner_player_id = None
 
     consume_command_point_and_advance_turn(
         session=game_session,
         players=players,
-        acting_player=acting_player
+        acting_player=acting_player,
+        db=db
     )
 
     db.commit()
 
     return {
-        "message": "Ark launched",
+        "message": "Colony packed into Ark",
         "action_cost": {
             "energy": UNIT_ACTION_ENERGY_COST
         },
         "session": get_full_session(session_id, db)
     }
+
+
+@router.post("/{session_id}/units/{unit_id}/pack-into-ark")
+def pack_colony_unit_into_ark_legacy(
+    session_id: int,
+    unit_id: int,
+    db: Session = Depends(get_db)
+):
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Deployed Colonies are buildings now. "
+            "Use /game/sessions/{session_id}/buildings/{building_id}/pack-into-ark."
+        )
+    )
 
 
 @router.post("/{session_id}/units/{unit_id}/colonize")
@@ -1282,16 +1604,16 @@ def colonize_system_with_ark(
             detail="Unit not found"
         )
 
-    if unit.unit_type != "colony":
+    if unit.unit_type not in ["ark", "colony"]:
         raise HTTPException(
             status_code=400,
-            detail="Only colony ark can colonize systems"
+            detail="Only Ark can colonize systems"
         )
 
     if unit.state != "ark":
         raise HTTPException(
             status_code=400,
-            detail="Only ark can colonize systems"
+            detail="Only Ark can colonize systems"
         )
 
     session_system = db.query(SessionSystem).filter(
@@ -1312,6 +1634,19 @@ def colonize_system_with_ark(
         raise HTTPException(
             status_code=400,
             detail="System is already colonized by another player"
+        )
+
+    existing_colony = db.query(SessionBuilding).filter(
+        SessionBuilding.session_id == session_id,
+        SessionBuilding.system_id == unit.system_id,
+        SessionBuilding.owner_player_id == unit.owner_player_id,
+        SessionBuilding.building_type == COLONY_BUILDING_TYPE
+    ).first()
+
+    if existing_colony:
+        raise HTTPException(
+            status_code=400,
+            detail="This player already has a Colony in this system"
         )
 
     owner_player = db.query(SessionPlayer).filter(
@@ -1340,16 +1675,32 @@ def colonize_system_with_ark(
 
     acting_player.energy -= UNIT_ACTION_ENERGY_COST
 
-    unit.state = "deployed"
-    unit.current_hp = None
-    unit.max_hp = None
+    colony = SessionBuilding(
+        session_id=session_id,
+        owner_player_id=unit.owner_player_id,
+        system_id=unit.system_id,
+        building_type=COLONY_BUILDING_TYPE
+    )
 
-    session_system.owner_player_id = unit.owner_player_id
+    fleet_id = unit.fleet_id
+
+    db.add(colony)
+    db.delete(unit)
+    db.flush()
+
+    session_system.owner_player_id = owner_player.id
+
+    delete_fleet_if_empty(
+        db=db,
+        session_id=session_id,
+        fleet_id=fleet_id
+    )
 
     consume_command_point_and_advance_turn(
         session=game_session,
         players=players,
-        acting_player=acting_player
+        acting_player=acting_player,
+        db=db
     )
 
     db.commit()
@@ -1441,6 +1792,12 @@ def delete_created_session(
 
     db.query(SessionBuilding).filter(
         SessionBuilding.session_id == session_id
+    ).delete(synchronize_session=False)
+
+    db.flush()
+
+    db.query(SessionFleet).filter(
+        SessionFleet.session_id == session_id
     ).delete(synchronize_session=False)
 
     db.flush()

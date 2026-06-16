@@ -24,3 +24,11 @@ class SessionUnit(Base):
     food_upkeep = Column(Integer, default=1)
 
     is_foundation = Column(Boolean, default=False, nullable=False)
+
+    fleet_id = Column(Integer, ForeignKey("session_fleets.id"), nullable=True)
+    slot_index = Column(Integer, nullable=True)
+
+    formation_weight = Column(Integer, default=50, nullable=False)
+    built_order = Column(Integer, default=0, nullable=False)
+
+    is_combat = Column(Boolean, default=True, nullable=False)
