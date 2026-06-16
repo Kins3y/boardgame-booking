@@ -6,4 +6,4 @@ from pydantic import BaseModel
 class BuildBuildingCreate(BaseModel):
     session_player_id: int
     system_id: int
-    building_type: Literal["mine", "power_plant", "storage"]
+    building_type: str

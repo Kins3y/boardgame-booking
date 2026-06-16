@@ -34,6 +34,16 @@ BUILDING_COSTS = {
         "matter": 3,
         "energy": 2,
         "data": 0
+    },
+    "barracks": {
+        "matter": 8,
+        "energy": 3,
+        "data": 0
+    },
+    "spaceport": {
+        "matter": 10,
+        "energy": 4,
+        "data": 1
     }
 }
 
@@ -42,6 +52,12 @@ BUILDING_SLOT_FIELD = {
     "mine": "mineral_slots",
     "power_plant": "energy_slots",
     "storage": "storage_slots"
+}
+
+
+BUILDING_MAX_PER_SYSTEM = {
+    "barracks": 1,
+    "spaceport": 1
 }
 
 
@@ -291,8 +307,11 @@ def build_building(
             detail="Not enough data"
         )
 
-    slot_field_name = BUILDING_SLOT_FIELD[building_type]
-    slot_limit = getattr(star_system, slot_field_name)
+    if building_type in BUILDING_SLOT_FIELD:
+        slot_field_name = BUILDING_SLOT_FIELD[building_type]
+        slot_limit = getattr(star_system, slot_field_name)
+    else:
+        slot_limit = BUILDING_MAX_PER_SYSTEM.get(building_type, 1)
 
     existing_buildings_count = db.query(SessionBuilding).filter(
         SessionBuilding.session_id == session_id,
