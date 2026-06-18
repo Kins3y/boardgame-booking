@@ -8,6 +8,7 @@ from app.game.models.session_player import SessionPlayer
 from app.game.models.session_system import SessionSystem
 from app.game.models.star_system import StarSystem
 from app.game.schemas.building import BuildBuildingCreate
+from app.game.services.game_log_service import create_game_log
 
 
 router = APIRouter(
@@ -337,11 +338,28 @@ def build_building(
     )
 
     db.add(new_building)
+    db.flush()
+
+    action_round = game_session.current_round
 
     consume_command_point_and_advance_turn(
         session=game_session,
         players=players,
         acting_player=acting_player
+    )
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="building_constructed",
+        actor=acting_player,
+        payload={
+            "building_id": new_building.id,
+            "building_type": building_type,
+            "system_id": build_request.system_id,
+            "cost": cost
+        },
+        round_number=action_round
     )
 
     db.commit()

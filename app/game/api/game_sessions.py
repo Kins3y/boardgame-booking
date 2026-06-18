@@ -13,6 +13,7 @@ from app.game.models.session_player import SessionPlayer
 from app.game.models.session_system import SessionSystem
 from app.game.models.session_unit import SessionUnit
 from app.game.models.session_fleet import SessionFleet
+from app.game.models.session_game_log import SessionGameLog
 from app.game.models.star_system import StarSystem
 from app.game.models.system_connection import SystemConnection
 from app.game.schemas.game_session import GameSessionCreate
@@ -20,6 +21,7 @@ from app.game.schemas.game_session import GameSessionUpdateName
 from app.game.schemas.session_player import SessionPlayerCreate
 from app.game.schemas.start_system import StartSystemOptionResponse
 from app.game.services.map_validator import validate_map
+from app.game.services.game_log_service import create_game_log
 from app.models.user import User
 
 
@@ -39,6 +41,14 @@ COLONY_BUILDING_TYPE = "colony"
 FLEET_ORDER_MOVE_DEFEND = "move_defend"
 FLEET_ORDER_MOVE_MOVE = "move_move"
 FLEET_ORDER_MOVE_TRANSFER = "move_transfer"
+FLEET_ORDER_TRANSFER_MOVE = "transfer_move"
+FLEET_ORDER_SPLIT_MOVE = "split_move"
+FLEET_ORDER_DEFEND = "defend"
+FLEET_ORDER_MOVE_ATTACK = "move_attack"
+FLEET_ORDER_CONTINUE_COMBAT = "continue_combat"
+FLEET_ORDER_RETREAT = "retreat"
+
+MAX_COMBAT_ROUNDS = 1
 
 DANGER_CARD_DEFINITIONS = [
     # No gameplay effect: 33 of 60 cards (55%).
@@ -305,6 +315,10 @@ class FleetCommandOrderCreate(BaseModel):
     second_target_system_id: int | None = None
     transfer_fleet_id: int | None = None
     transfer_fleet_target_system_id: int | None = None
+    continuing_fleet_id: int | None = None
+    target_fleet_id: int | None = None
+    split_fleet_target_system_id: int | None = None
+    split_unit_ids: list[int] = Field(default_factory=list)
     unit_ids_to_transfer_fleet: list[int] = Field(default_factory=list)
     unit_ids_to_command_fleet: list[int] = Field(default_factory=list)
 
@@ -588,6 +602,45 @@ def get_connection_between_systems(
     return None
 
 
+
+
+def get_hostile_fleets_in_system(
+    db: Session,
+    session_id: int,
+    system_id: int,
+    owner_player_id: int
+) -> list[SessionFleet]:
+    return db.query(SessionFleet).filter(
+        SessionFleet.session_id == session_id,
+        SessionFleet.system_id == system_id,
+        SessionFleet.owner_player_id != owner_player_id
+    ).all()
+
+
+def require_system_free_of_hostile_fleets(
+    db: Session,
+    session_id: int,
+    system_id: int,
+    owner_player_id: int,
+    movement_label: str
+):
+    hostile_fleets = get_hostile_fleets_in_system(
+        db=db,
+        session_id=session_id,
+        system_id=system_id,
+        owner_player_id=owner_player_id
+    )
+
+    if hostile_fleets:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{movement_label} enters a system with an enemy fleet. "
+                "Use Move → Attack instead."
+            )
+        )
+
+
 def get_corridor_danger_cards(connection: SystemConnection) -> int:
     if getattr(connection, "is_wraparound", False):
         return 2
@@ -757,6 +810,220 @@ def resolve_danger_cards(
             break
 
     return results
+
+
+def get_fleet_attack_power(
+    db: Session,
+    session_id: int,
+    fleet_id: int
+) -> int:
+    return sum(
+        max(0, unit.attack)
+        for unit in get_fleet_units(db, session_id, fleet_id)
+        if unit.is_combat
+    )
+
+
+def get_fleet_defense_power(
+    db: Session,
+    session_id: int,
+    fleet_id: int
+) -> int:
+    return sum(
+        max(0, unit.defense)
+        for unit in get_fleet_units(db, session_id, fleet_id)
+    )
+
+
+def select_hostile_interceptor(
+    db: Session,
+    session_id: int,
+    system_id: int,
+    moving_owner_player_id: int
+) -> SessionFleet | None:
+    """Choose the deterministic fleet that reacts to a hostile Move → Move arrival."""
+    hostile_fleets = get_hostile_fleets_in_system(
+        db=db,
+        session_id=session_id,
+        system_id=system_id,
+        owner_player_id=moving_owner_player_id
+    )
+
+    if not hostile_fleets:
+        return None
+
+    return sorted(
+        hostile_fleets,
+        key=lambda candidate: (
+            1 if candidate.is_defensive else 0,
+            get_fleet_attack_power(db, session_id, candidate.id),
+            count_fleet_units(db, session_id, candidate.id),
+            -candidate.id
+        ),
+        reverse=True
+    )[0]
+
+
+def resolve_one_way_interception(
+    db: Session,
+    session_id: int,
+    moving_fleet: SessionFleet,
+    interceptor: SessionFleet
+) -> dict:
+    """Resolve one defender strike without return fire from the moving fleet."""
+    attack_power = get_fleet_attack_power(db, session_id, interceptor.id)
+    moving_defense = get_fleet_defense_power(db, session_id, moving_fleet.id)
+    damage = max(1, attack_power - moving_defense) if attack_power > 0 else 0
+    damage_events = apply_damage_to_fleet(
+        db=db,
+        session_id=session_id,
+        fleet_id=moving_fleet.id,
+        damage=damage
+    )
+
+    return {
+        "attack_power": attack_power,
+        "target_defense": moving_defense,
+        "damage": damage,
+        "damage_events": damage_events,
+        "moving_fleet_destroyed": (
+            count_fleet_units(db, session_id, moving_fleet.id) == 0
+        )
+    }
+
+
+def apply_damage_to_fleet(
+    db: Session,
+    session_id: int,
+    fleet_id: int,
+    damage: int
+) -> list[dict]:
+    remaining_damage = max(0, damage)
+    events: list[dict] = []
+
+    for unit in get_fleet_units(db, session_id, fleet_id):
+        if remaining_damage <= 0:
+            break
+
+        hp_before = (
+            unit.current_hp
+            if unit.current_hp is not None
+            else unit.max_hp
+        )
+
+        if hp_before is None or hp_before <= 0:
+            continue
+
+        applied_damage = min(remaining_damage, hp_before)
+        hp_after = max(0, hp_before - applied_damage)
+        unit_destroyed = hp_after <= 0
+        unit_name = UNIT_DEFINITIONS.get(
+            unit.unit_type,
+            {"name": unit.unit_type.replace("_", " ").title()}
+        )["name"]
+
+        events.append({
+            "unit_id": unit.id,
+            "unit_type": unit.unit_type,
+            "unit_name": unit_name,
+            "damage": applied_damage,
+            "hp_before": hp_before,
+            "hp_after": hp_after,
+            "destroyed": unit_destroyed
+        })
+
+        remaining_damage -= applied_damage
+
+        if unit_destroyed:
+            db.delete(unit)
+            db.flush()
+        else:
+            unit.current_hp = hp_after
+
+    return events
+
+
+def resolve_single_combat_exchange(
+    db: Session,
+    session_id: int,
+    attacker: SessionFleet,
+    defender: SessionFleet
+) -> dict:
+    """Resolve exactly one simultaneous combat exchange.
+
+    Both sides calculate their attack and defense before any damage is applied.
+    Surviving fleets remain engaged in the same system and may continue combat
+    or retreat during a later action.
+    """
+    attacker_units_count = count_fleet_units(db, session_id, attacker.id)
+    defender_units_count = count_fleet_units(db, session_id, defender.id)
+
+    if attacker_units_count <= 0 or defender_units_count <= 0:
+        exchange = None
+    else:
+        attacker_attack = get_fleet_attack_power(db, session_id, attacker.id)
+        attacker_defense = get_fleet_defense_power(db, session_id, attacker.id)
+        defender_attack = get_fleet_attack_power(db, session_id, defender.id)
+        defender_defense = get_fleet_defense_power(db, session_id, defender.id)
+
+        damage_to_defender = (
+            max(1, attacker_attack - defender_defense)
+            if attacker_attack > 0
+            else 0
+        )
+        damage_to_attacker = (
+            max(1, defender_attack - attacker_defense)
+            if defender_attack > 0
+            else 0
+        )
+
+        # Damage values are calculated before either side takes losses, so the
+        # exchange is simultaneous even if one fleet is destroyed.
+        defender_damage_events = apply_damage_to_fleet(
+            db=db,
+            session_id=session_id,
+            fleet_id=defender.id,
+            damage=damage_to_defender
+        )
+        attacker_damage_events = apply_damage_to_fleet(
+            db=db,
+            session_id=session_id,
+            fleet_id=attacker.id,
+            damage=damage_to_attacker
+        )
+
+        exchange = {
+            "round": 1,
+            "attacker_attack": attacker_attack,
+            "attacker_defense": attacker_defense,
+            "defender_attack": defender_attack,
+            "defender_defense": defender_defense,
+            "damage_to_defender": damage_to_defender,
+            "damage_to_attacker": damage_to_attacker,
+            "defender_damage_events": defender_damage_events,
+            "attacker_damage_events": attacker_damage_events
+        }
+
+    attacker_destroyed = count_fleet_units(db, session_id, attacker.id) == 0
+    defender_destroyed = count_fleet_units(db, session_id, defender.id) == 0
+
+    if attacker_destroyed and defender_destroyed:
+        outcome = "mutual_destruction"
+    elif defender_destroyed:
+        outcome = "attacker_victory"
+    elif attacker_destroyed:
+        outcome = "defender_victory"
+    else:
+        outcome = "engagement_continues"
+
+    return {
+        "rounds": [exchange] if exchange is not None else [],
+        "exchange": exchange,
+        "outcome": outcome,
+        "attacker_destroyed": attacker_destroyed,
+        "defender_destroyed": defender_destroyed,
+        "engagement_continues": not attacker_destroyed and not defender_destroyed
+    }
 
 
 def get_next_available_unit_slot(
@@ -1150,6 +1417,46 @@ def build_income_report_and_apply_income(
         })
 
     return income_report
+
+
+@router.get("/{session_id}/logs")
+def get_session_game_logs(
+    session_id: int,
+    limit: int = 500,
+    db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    safe_limit = max(1, min(limit, 1000))
+    entries = db.query(SessionGameLog).filter(
+        SessionGameLog.session_id == session_id
+    ).order_by(SessionGameLog.id.asc()).limit(safe_limit).all()
+
+    return {
+        "session_id": session_id,
+        "session_name": game_session.name,
+        "logs": [
+            {
+                "id": entry.id,
+                "session_id": entry.session_id,
+                "round_number": entry.round_number,
+                "actor_player_id": entry.actor_player_id,
+                "event_type": entry.event_type,
+                "payload": entry.payload or {},
+                "created_at": (
+                    entry.created_at.isoformat()
+                    if entry.created_at is not None
+                    else None
+                )
+            }
+            for entry in entries
+        ]
+    }
 
 
 @router.get("/overview")
@@ -1755,14 +2062,64 @@ def start_session(
             system_id=player.start_system_id,
             building_type=COLONY_BUILDING_TYPE
         )
-
         db.add(starting_colony)
+
+        starting_fleet = SessionFleet(
+            session_id=session_id,
+            owner_player_id=player.id,
+            system_id=player.start_system_id,
+            fleet_number=1,
+            name="Fleet 1",
+            is_defensive=False,
+            has_acted_this_round=False
+        )
+        db.add(starting_fleet)
+        db.flush()
+
+        scout_definition = get_unit_definition("scout")
+        starting_scout = SessionUnit(
+            session_id=session_id,
+            owner_player_id=player.id,
+            system_id=player.start_system_id,
+            fleet_id=starting_fleet.id,
+            slot_index=1,
+            unit_type="scout",
+            state=scout_definition["state"],
+            attack=scout_definition["attack"],
+            defense=scout_definition["defense"],
+            current_hp=scout_definition["hp"],
+            max_hp=scout_definition["hp"],
+            food_upkeep=scout_definition["food_upkeep"],
+            is_foundation=False,
+            formation_weight=get_unit_formation_weight("scout"),
+            built_order=1,
+            is_combat=scout_definition["is_combat"]
+        )
+        db.add(starting_scout)
 
     game_session.status = "started"
     game_session.current_round = 1
     game_session.play_mode = "hotseat"
 
     start_action_phase(game_session, players, db)
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="game_started",
+        payload={
+            "players": [
+                {
+                    "session_player_id": player.id,
+                    "faction_name": player.faction_name,
+                    "start_system_id": player.start_system_id
+                }
+                for player in players
+            ],
+            "starting_units": {"scout": 1},
+            "starting_colonies": 1
+        }
+    )
 
     db.commit()
     db.refresh(game_session)
@@ -1810,6 +2167,13 @@ def next_round(
 
     game_session.current_round += 1
     start_action_phase(game_session, players, db)
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="round_started",
+        payload={"income_report": income_report}
+    )
 
     db.commit()
 
@@ -1884,12 +2248,25 @@ def end_current_turn(
             "session": get_full_session(session_id, db)
         }
 
+    action_round = game_session.current_round
     current_player.command_points_left -= 1
 
     if current_player.command_points_left <= 0:
         current_player.has_passed = True
 
     advance_turn_or_start_next_round(game_session, players, db)
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="turn_ended",
+        actor=current_player,
+        payload={
+            "command_points_left": current_player.command_points_left,
+            "next_player_id": game_session.current_player_id
+        },
+        round_number=action_round
+    )
 
     db.commit()
     db.refresh(game_session)
@@ -1938,8 +2315,17 @@ def pass_current_player(
         game_session.current_turn_index = 0
         game_session.current_player_id = players[0].id
     else:
+        action_round = game_session.current_round
         current_player.has_passed = True
         advance_turn_or_start_next_round(game_session, players, db)
+        create_game_log(
+            db=db,
+            session=game_session,
+            event_type="player_passed",
+            actor=current_player,
+            payload={"next_player_id": game_session.current_player_id},
+            round_number=action_round
+        )
 
     db.commit()
     db.refresh(game_session)
@@ -2074,12 +2460,34 @@ def produce_unit_from_building(
     )
 
     db.add(produced_unit)
+    db.flush()
+
+    action_round = game_session.current_round
 
     consume_command_point_and_advance_turn(
         session=game_session,
         players=players,
         acting_player=acting_player,
         db=db
+    )
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="unit_produced",
+        actor=acting_player,
+        payload={
+            "unit_id": produced_unit.id,
+            "unit_type": produced_unit.unit_type,
+            "fleet_id": produced_unit.fleet_id,
+            "system_id": produced_unit.system_id,
+            "cost": {
+                "matter": unit_definition["matter"],
+                "energy": unit_definition["energy"],
+                "data": unit_definition["data"]
+            }
+        },
+        round_number=action_round
     )
 
     db.commit()
@@ -2243,11 +2651,27 @@ def pack_colony_building_into_ark(
         ):
             session_system.owner_player_id = None
 
+    action_round = game_session.current_round
+
     consume_command_point_and_advance_turn(
         session=game_session,
         players=players,
         acting_player=acting_player,
         db=db
+    )
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="colony_packed",
+        actor=acting_player,
+        payload={
+            "system_id": colony_system_id,
+            "fleet_id": fleet.id,
+            "ark_id": ark.id,
+            "energy_cost": UNIT_ACTION_ENERGY_COST
+        },
+        round_number=action_round
     )
 
     db.commit()
@@ -2401,11 +2825,26 @@ def colonize_system_with_ark(
         fleet_id=fleet_id
     )
 
+    action_round = game_session.current_round
+
     consume_command_point_and_advance_turn(
         session=game_session,
         players=players,
         acting_player=acting_player,
         db=db
+    )
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="system_colonized",
+        actor=acting_player,
+        payload={
+            "system_id": session_system.system_id,
+            "former_fleet_id": fleet_id,
+            "energy_cost": UNIT_ACTION_ENERGY_COST
+        },
+        round_number=action_round
     )
 
     db.commit()
@@ -2479,6 +2918,8 @@ def issue_fleet_command(
         )
 
     participating_fleet_ids: set[int] = set()
+    attacked_fleet_ids: set[int] = set()
+    planned_split_fleets = 0
     resolved_orders = []
 
     for order in command.orders:
@@ -2494,14 +2935,27 @@ def issue_fleet_command(
         if order.order_type not in {
             FLEET_ORDER_MOVE_DEFEND,
             FLEET_ORDER_MOVE_MOVE,
-            FLEET_ORDER_MOVE_TRANSFER
+            FLEET_ORDER_MOVE_TRANSFER,
+            FLEET_ORDER_TRANSFER_MOVE,
+            FLEET_ORDER_SPLIT_MOVE,
+            FLEET_ORDER_DEFEND,
+            FLEET_ORDER_MOVE_ATTACK,
+            FLEET_ORDER_CONTINUE_COMBAT,
+            FLEET_ORDER_RETREAT
         }:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unsupported fleet order type: {order.order_type}"
             )
 
-        if order.target_system_id is None:
+        if (
+            order.order_type not in {
+                FLEET_ORDER_SPLIT_MOVE,
+                FLEET_ORDER_DEFEND,
+                FLEET_ORDER_CONTINUE_COMBAT
+            }
+            and order.target_system_id is None
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="Fleet movement requires target_system_id"
@@ -2551,6 +3005,308 @@ def issue_fleet_command(
                 detail=f"{fleet.name} has no units and cannot move"
             )
 
+        hostile_fleets_in_source = db.query(SessionFleet).filter(
+            SessionFleet.session_id == session_id,
+            SessionFleet.system_id == fleet.system_id,
+            SessionFleet.owner_player_id != acting_player.id
+        ).all()
+        hostile_fleets_in_source = [
+            hostile_fleet
+            for hostile_fleet in hostile_fleets_in_source
+            if count_fleet_units(db, session_id, hostile_fleet.id) > 0
+        ]
+        fleet_is_engaged = len(hostile_fleets_in_source) > 0
+
+        if fleet_is_engaged and order.order_type not in {
+            FLEET_ORDER_CONTINUE_COMBAT,
+            FLEET_ORDER_RETREAT
+        }:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{fleet.name} is engaged with an enemy fleet. "
+                    "It must Continue Combat or Retreat."
+                )
+            )
+
+        if (
+            not fleet_is_engaged
+            and order.order_type in {
+                FLEET_ORDER_CONTINUE_COMBAT,
+                FLEET_ORDER_RETREAT
+            }
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{fleet.name} is not currently engaged with an enemy fleet"
+                )
+            )
+
+        if order.order_type == FLEET_ORDER_DEFEND:
+            current_system = db.query(StarSystem).filter(
+                StarSystem.id == fleet.system_id
+            ).first()
+
+            participating_fleet_ids.add(fleet.id)
+            resolved_orders.append({
+                "fleet": fleet,
+                "order_type": order.order_type,
+                "steps": [],
+                "final_system_id": fleet.system_id,
+                "final_system_name": (
+                    current_system.name if current_system else None
+                ),
+                "becomes_defensive": True,
+                "total_danger_cards": 0,
+                "transfer_fleet": None,
+                "transfer_fleet_move_step": None,
+                "continuing_fleet": None,
+                "target_fleet": None,
+                "unit_ids_to_transfer_fleet": [],
+                "unit_ids_to_command_fleet": [],
+                "split_unit_ids": [],
+                "split_source_move_step": None,
+                "split_new_fleet_move_step": None,
+                "retreat": None
+            })
+            continue
+
+        if order.order_type == FLEET_ORDER_CONTINUE_COMBAT:
+            if order.target_fleet_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Continue Combat requires target_fleet_id"
+                )
+
+            target_fleet = db.query(SessionFleet).filter(
+                SessionFleet.id == order.target_fleet_id,
+                SessionFleet.session_id == session_id
+            ).first()
+
+            if not target_fleet:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Target fleet not found"
+                )
+
+            if target_fleet.owner_player_id == acting_player.id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A player cannot attack a friendly fleet"
+                )
+
+            if target_fleet.system_id != fleet.system_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Continue Combat target must share the acting fleet's system"
+                    )
+                )
+
+            if count_fleet_units(db, session_id, target_fleet.id) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The selected target fleet has no units"
+                )
+
+            if target_fleet.id in attacked_fleet_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The same defending fleet cannot be attacked twice "
+                        "during one Fleet Command"
+                    )
+                )
+
+            attacked_fleet_ids.add(target_fleet.id)
+            current_system = db.query(StarSystem).filter(
+                StarSystem.id == fleet.system_id
+            ).first()
+            participating_fleet_ids.add(fleet.id)
+            resolved_orders.append({
+                "fleet": fleet,
+                "order_type": order.order_type,
+                "steps": [],
+                "final_system_id": fleet.system_id,
+                "final_system_name": current_system.name if current_system else None,
+                "becomes_defensive": False,
+                "total_danger_cards": 0,
+                "transfer_fleet": None,
+                "transfer_fleet_move_step": None,
+                "continuing_fleet": None,
+                "target_fleet": target_fleet,
+                "unit_ids_to_transfer_fleet": [],
+                "unit_ids_to_command_fleet": [],
+                "split_unit_ids": [],
+                "split_source_move_step": None,
+                "split_new_fleet_move_step": None,
+                "retreat": None
+            })
+            continue
+
+        if order.order_type == FLEET_ORDER_SPLIT_MOVE:
+            if len(source_units) < 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Split → Move requires a fleet with at least 2 units"
+                )
+
+            active_fleet_count = db.query(SessionFleet).filter(
+                SessionFleet.session_id == session_id,
+                SessionFleet.owner_player_id == acting_player.id
+            ).count()
+
+            if active_fleet_count + planned_split_fleets >= FLEETS_PER_PLAYER:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Player has no free fleet slot for Split → Move"
+                )
+
+            split_unit_ids = list(dict.fromkeys(order.split_unit_ids))
+
+            if len(split_unit_ids) != len(order.split_unit_ids):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Split unit list cannot contain duplicates"
+                )
+
+            if not split_unit_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select at least one unit for the new fleet"
+                )
+
+            if len(split_unit_ids) >= len(source_units):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "At least one unit must remain in the source fleet "
+                        "after the split"
+                    )
+                )
+
+            source_unit_ids = {unit.id for unit in source_units}
+            invalid_split_ids = [
+                unit_id
+                for unit_id in split_unit_ids
+                if unit_id not in source_unit_ids
+            ]
+
+            if invalid_split_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Split units must belong to the selected source fleet: "
+                        f"{invalid_split_ids}"
+                    )
+                )
+
+            source_system = db.query(StarSystem).filter(
+                StarSystem.id == fleet.system_id
+            ).first()
+
+            def build_split_movement_step(
+                target_system_id: int | None,
+                movement_label: str,
+                step_number: int
+            ) -> dict | None:
+                if target_system_id is None:
+                    return None
+
+                target_session_system = db.query(SessionSystem).filter(
+                    SessionSystem.session_id == session_id,
+                    SessionSystem.system_id == target_system_id
+                ).first()
+
+                if not target_session_system:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"{movement_label} target is not part of this session"
+                    )
+
+                require_system_free_of_hostile_fleets(
+                    db=db,
+                    session_id=session_id,
+                    system_id=target_system_id,
+                    owner_player_id=acting_player.id,
+                    movement_label=movement_label
+                )
+
+                connection = get_connection_between_systems(
+                    db=db,
+                    map_id=game_session.map_id,
+                    from_system_id=fleet.system_id,
+                    to_system_id=target_system_id
+                )
+
+                if not connection:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"{movement_label} must use a directly connected "
+                            "corridor from the source system"
+                        )
+                    )
+
+                target_system = db.query(StarSystem).filter(
+                    StarSystem.id == target_system_id
+                ).first()
+
+                return {
+                    "step": step_number,
+                    "from_system_id": fleet.system_id,
+                    "from_system_name": (
+                        source_system.name if source_system else None
+                    ),
+                    "to_system_id": target_system_id,
+                    "to_system_name": (
+                        target_system.name if target_system else None
+                    ),
+                    "corridor_type": get_corridor_type(connection),
+                    "danger_cards": get_corridor_danger_cards(connection)
+                }
+
+            source_move_step = build_split_movement_step(
+                order.target_system_id,
+                "Source fleet movement",
+                1
+            )
+            new_fleet_move_step = build_split_movement_step(
+                order.split_fleet_target_system_id,
+                "New fleet movement",
+                2
+            )
+
+            planned_split_fleets += 1
+            participating_fleet_ids.add(fleet.id)
+            resolved_orders.append({
+                "fleet": fleet,
+                "order_type": order.order_type,
+                "steps": [],
+                "final_system_id": fleet.system_id,
+                "final_system_name": (
+                    source_system.name if source_system else None
+                ),
+                "becomes_defensive": False,
+                "total_danger_cards": sum(
+                    step["danger_cards"]
+                    for step in [source_move_step, new_fleet_move_step]
+                    if step is not None
+                ),
+                "transfer_fleet": None,
+                "transfer_fleet_move_step": None,
+                "continuing_fleet": None,
+                "target_fleet": None,
+                "unit_ids_to_transfer_fleet": [],
+                "unit_ids_to_command_fleet": [],
+                "split_unit_ids": split_unit_ids,
+                "split_source_move_step": source_move_step,
+                "split_new_fleet_move_step": new_fleet_move_step,
+                "retreat": None
+            })
+            continue
+
         first_target_session_system = db.query(SessionSystem).filter(
             SessionSystem.session_id == session_id,
             SessionSystem.system_id == order.target_system_id
@@ -2560,6 +3316,18 @@ def issue_fleet_command(
             raise HTTPException(
                 status_code=404,
                 detail="First target system is not part of this session"
+            )
+
+        if order.order_type not in {
+            FLEET_ORDER_MOVE_ATTACK,
+            FLEET_ORDER_MOVE_MOVE
+        }:
+            require_system_free_of_hostile_fleets(
+                db=db,
+                session_id=session_id,
+                system_id=order.target_system_id,
+                owner_player_id=acting_player.id,
+                movement_label=f"{fleet.name}: movement"
             )
 
         first_connection = get_connection_between_systems(
@@ -2607,61 +3375,266 @@ def issue_fleet_command(
         becomes_defensive = order.order_type == FLEET_ORDER_MOVE_DEFEND
         transfer_fleet = None
         transfer_fleet_move_step = None
+        continuing_fleet = None
+        target_fleet = None
+        retreat_report = None
+        hostile_entry = None
         unit_ids_to_transfer_fleet: list[int] = []
         unit_ids_to_command_fleet: list[int] = []
 
-        if order.order_type == FLEET_ORDER_MOVE_MOVE:
-            second_target_system_id = order.second_target_system_id
-
-            second_target_session_system = db.query(SessionSystem).filter(
-                SessionSystem.session_id == session_id,
-                SessionSystem.system_id == second_target_system_id
-            ).first()
-
-            if not second_target_session_system:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Second target system is not part of this session"
+        if order.order_type == FLEET_ORDER_RETREAT:
+            own_unit_count = len(source_units)
+            pursuing_fleet = max(
+                hostile_fleets_in_source,
+                key=lambda hostile: (
+                    count_fleet_units(db, session_id, hostile.id),
+                    -hostile.id
                 )
+            )
+            pursuing_unit_count = count_fleet_units(
+                db, session_id, pursuing_fleet.id
+            )
+            pursuit_danger_cards = max(
+                0,
+                pursuing_unit_count - own_unit_count
+            )
+            corridor_danger_cards = steps[0]["danger_cards"]
+            steps[0]["corridor_danger_cards"] = corridor_danger_cards
+            steps[0]["pursuit_danger_cards"] = pursuit_danger_cards
+            steps[0]["danger_cards"] = (
+                corridor_danger_cards + pursuit_danger_cards
+            )
+            retreat_report = {
+                "pursuing_fleet_id": pursuing_fleet.id,
+                "pursuing_fleet_name": pursuing_fleet.name,
+                "retreating_unit_count": own_unit_count,
+                "pursuing_unit_count": pursuing_unit_count,
+                "pursuit_danger_cards": pursuit_danger_cards,
+                "corridor_danger_cards": corridor_danger_cards,
+                "total_danger_cards": steps[0]["danger_cards"]
+            }
 
-            second_connection = get_connection_between_systems(
+        if order.order_type == FLEET_ORDER_MOVE_MOVE:
+            # Move → Move may now be intercepted after either movement step.
+            # If the first destination contains an enemy fleet, interception is
+            # resolved there and the second movement is cancelled.
+            first_destination_owner_id = (
+                first_target_session_system.owner_player_id
+            )
+            first_destination_is_hostile_controlled = (
+                first_destination_owner_id is not None
+                and first_destination_owner_id != acting_player.id
+            )
+            first_interceptor = select_hostile_interceptor(
                 db=db,
-                map_id=game_session.map_id,
-                from_system_id=order.target_system_id,
-                to_system_id=second_target_system_id
+                session_id=session_id,
+                system_id=order.target_system_id,
+                moving_owner_player_id=acting_player.id
             )
 
-            if not second_connection:
+            if first_interceptor is not None:
+                first_destination_owner = (
+                    db.query(SessionPlayer).filter(
+                        SessionPlayer.id == first_destination_owner_id,
+                        SessionPlayer.session_id == session_id
+                    ).first()
+                    if first_destination_owner_id is not None
+                    else None
+                )
+                first_interceptor_owner = db.query(SessionPlayer).filter(
+                    SessionPlayer.id == first_interceptor.owner_player_id,
+                    SessionPlayer.session_id == session_id
+                ).first()
+
+                hostile_entry = {
+                    "step_number": 1,
+                    "movement_ended_early": True,
+                    "destination_owner_player_id": (
+                        first_destination_owner_id
+                    ),
+                    "destination_owner_name": (
+                        first_destination_owner.faction_name
+                        if first_destination_owner
+                        else None
+                    ),
+                    "hostile_controlled": (
+                        first_destination_is_hostile_controlled
+                    ),
+                    "interceptor": first_interceptor,
+                    "interceptor_owner_name": (
+                        first_interceptor_owner.faction_name
+                        if first_interceptor_owner
+                        else None
+                    )
+                }
+
+                # The hostile fleet pins the moving fleet in this system.
+                # The unused second movement is lost.
+                final_system_id = order.target_system_id
+                final_system_name = (
+                    first_target_system.name if first_target_system else None
+                )
+            else:
+                second_target_system_id = order.second_target_system_id
+
+                if second_target_system_id is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Move → Move requires a second target unless the "
+                            "fleet is intercepted after the first movement"
+                        )
+                    )
+
+                second_target_session_system = db.query(SessionSystem).filter(
+                    SessionSystem.session_id == session_id,
+                    SessionSystem.system_id == second_target_system_id
+                ).first()
+
+                if not second_target_session_system:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Second target system is not part of this session"
+                    )
+
+                second_connection = get_connection_between_systems(
+                    db=db,
+                    map_id=game_session.map_id,
+                    from_system_id=order.target_system_id,
+                    to_system_id=second_target_system_id
+                )
+
+                if not second_connection:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"{fleet.name}: second movement must use a directly "
+                            "connected corridor from the first selected system"
+                        )
+                    )
+
+                second_target_system = db.query(StarSystem).filter(
+                    StarSystem.id == second_target_system_id
+                ).first()
+
+                steps.append({
+                    "step": 2,
+                    "from_system_id": order.target_system_id,
+                    "from_system_name": (
+                        first_target_system.name if first_target_system else None
+                    ),
+                    "to_system_id": second_target_system_id,
+                    "to_system_name": (
+                        second_target_system.name if second_target_system else None
+                    ),
+                    "corridor_type": get_corridor_type(second_connection),
+                    "danger_cards": get_corridor_danger_cards(second_connection)
+                })
+
+                final_system_id = second_target_system_id
+                final_system_name = (
+                    second_target_system.name if second_target_system else None
+                )
+
+                destination_owner_id = (
+                    second_target_session_system.owner_player_id
+                )
+                destination_is_hostile_controlled = (
+                    destination_owner_id is not None
+                    and destination_owner_id != acting_player.id
+                )
+                interceptor = select_hostile_interceptor(
+                    db=db,
+                    session_id=session_id,
+                    system_id=second_target_system_id,
+                    moving_owner_player_id=acting_player.id
+                )
+
+                if destination_is_hostile_controlled or interceptor is not None:
+                    destination_owner = (
+                        db.query(SessionPlayer).filter(
+                            SessionPlayer.id == destination_owner_id,
+                            SessionPlayer.session_id == session_id
+                        ).first()
+                        if destination_owner_id is not None
+                        else None
+                    )
+                    interceptor_owner = (
+                        db.query(SessionPlayer).filter(
+                            SessionPlayer.id == interceptor.owner_player_id,
+                            SessionPlayer.session_id == session_id
+                        ).first()
+                        if interceptor is not None
+                        else None
+                    )
+                    hostile_entry = {
+                        "step_number": 2,
+                        "movement_ended_early": False,
+                        "destination_owner_player_id": destination_owner_id,
+                        "destination_owner_name": (
+                            destination_owner.faction_name
+                            if destination_owner
+                            else None
+                        ),
+                        "hostile_controlled": destination_is_hostile_controlled,
+                        "interceptor": interceptor,
+                        "interceptor_owner_name": (
+                            interceptor_owner.faction_name
+                            if interceptor_owner
+                            else None
+                        )
+                    }
+
+
+        if order.order_type == FLEET_ORDER_MOVE_ATTACK:
+            if order.target_fleet_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Move → Attack requires target_fleet_id"
+                )
+
+            if order.target_fleet_id in attacked_fleet_ids:
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        f"{fleet.name}: second movement must use a directly "
-                        "connected corridor from the first selected system"
+                        "The same defending fleet cannot be attacked twice "
+                        "during one Fleet Command"
                     )
                 )
 
-            second_target_system = db.query(StarSystem).filter(
-                StarSystem.id == second_target_system_id
+            target_fleet = db.query(SessionFleet).filter(
+                SessionFleet.id == order.target_fleet_id,
+                SessionFleet.session_id == session_id
             ).first()
 
-            steps.append({
-                "step": 2,
-                "from_system_id": order.target_system_id,
-                "from_system_name": (
-                    first_target_system.name if first_target_system else None
-                ),
-                "to_system_id": second_target_system_id,
-                "to_system_name": (
-                    second_target_system.name if second_target_system else None
-                ),
-                "corridor_type": get_corridor_type(second_connection),
-                "danger_cards": get_corridor_danger_cards(second_connection)
-            })
+            if not target_fleet:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Target fleet not found"
+                )
 
-            final_system_id = second_target_system_id
-            final_system_name = (
-                second_target_system.name if second_target_system else None
-            )
+            if target_fleet.owner_player_id == acting_player.id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A player cannot attack a friendly fleet"
+                )
+
+            if target_fleet.system_id != order.target_system_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The selected target fleet is not located in the "
+                        "attack destination system"
+                    )
+                )
+
+            if count_fleet_units(db, session_id, target_fleet.id) == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The selected target fleet has no units"
+                )
+
+            attacked_fleet_ids.add(target_fleet.id)
 
         if order.order_type == FLEET_ORDER_MOVE_TRANSFER:
             if order.transfer_fleet_id is None:
@@ -2841,6 +3814,16 @@ def issue_fleet_command(
                         )
                     )
 
+                require_system_free_of_hostile_fleets(
+                    db=db,
+                    session_id=session_id,
+                    system_id=order.transfer_fleet_target_system_id,
+                    owner_player_id=acting_player.id,
+                    movement_label=(
+                        f"{transfer_fleet.name}: remaining movement"
+                    )
+                )
+
                 transfer_move_connection = get_connection_between_systems(
                     db=db,
                     map_id=game_session.map_id,
@@ -2885,6 +3868,195 @@ def issue_fleet_command(
 
             participating_fleet_ids.add(transfer_fleet.id)
 
+        if order.order_type == FLEET_ORDER_TRANSFER_MOVE:
+            if order.transfer_fleet_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transfer → Move requires transfer_fleet_id"
+                )
+
+            if order.continuing_fleet_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transfer → Move requires continuing_fleet_id"
+                )
+
+            if order.transfer_fleet_id == fleet.id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="A fleet cannot transfer units with itself"
+                )
+
+            if order.transfer_fleet_id in participating_fleet_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The selected transfer fleet already participates in "
+                        "another order in this Fleet Command"
+                    )
+                )
+
+            unit_ids_to_transfer_fleet = list(
+                dict.fromkeys(order.unit_ids_to_transfer_fleet)
+            )
+            unit_ids_to_command_fleet = list(
+                dict.fromkeys(order.unit_ids_to_command_fleet)
+            )
+
+            if (
+                not unit_ids_to_transfer_fleet
+                and not unit_ids_to_command_fleet
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transfer → Move must move at least one unit"
+                )
+
+            if (
+                len(unit_ids_to_transfer_fleet)
+                != len(order.unit_ids_to_transfer_fleet)
+                or len(unit_ids_to_command_fleet)
+                != len(order.unit_ids_to_command_fleet)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Transfer unit lists cannot contain duplicates"
+                )
+
+            transfer_fleet = db.query(SessionFleet).filter(
+                SessionFleet.id == order.transfer_fleet_id,
+                SessionFleet.session_id == session_id
+            ).first()
+
+            if not transfer_fleet:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Transfer fleet not found"
+                )
+
+            if transfer_fleet.owner_player_id != acting_player.id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Units can be transferred only between friendly fleets"
+                )
+
+            if transfer_fleet.system_id != fleet.system_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Transfer → Move requires both fleets to start in "
+                        "the same system"
+                    )
+                )
+
+            if transfer_fleet.has_acted_this_round:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{transfer_fleet.name} has already acted this round"
+                )
+
+            if order.continuing_fleet_id not in {fleet.id, transfer_fleet.id}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "The continuing fleet must be one of the two fleets "
+                        "participating in the transfer"
+                    )
+                )
+
+            transfer_units = get_fleet_units(
+                db=db,
+                session_id=session_id,
+                fleet_id=transfer_fleet.id
+            )
+
+            if not transfer_units:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{transfer_fleet.name} has no units to transfer"
+                )
+
+            source_units_by_id = {unit.id: unit for unit in source_units}
+            transfer_units_by_id = {unit.id: unit for unit in transfer_units}
+
+            invalid_source_ids = [
+                unit_id
+                for unit_id in unit_ids_to_transfer_fleet
+                if unit_id not in source_units_by_id
+            ]
+            invalid_transfer_ids = [
+                unit_id
+                for unit_id in unit_ids_to_command_fleet
+                if unit_id not in transfer_units_by_id
+            ]
+
+            if invalid_source_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Units {invalid_source_ids} do not belong to "
+                        f"{fleet.name}"
+                    )
+                )
+
+            if invalid_transfer_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Units {invalid_transfer_ids} do not belong to "
+                        f"{transfer_fleet.name}"
+                    )
+                )
+
+            source_projected_count = (
+                len(source_units)
+                - len(unit_ids_to_transfer_fleet)
+                + len(unit_ids_to_command_fleet)
+            )
+            transfer_projected_count = (
+                len(transfer_units)
+                - len(unit_ids_to_command_fleet)
+                + len(unit_ids_to_transfer_fleet)
+            )
+
+            if source_projected_count > UNITS_PER_FLEET:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{fleet.name} would exceed the "
+                        f"{UNITS_PER_FLEET}-unit limit"
+                    )
+                )
+
+            if transfer_projected_count > UNITS_PER_FLEET:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"{transfer_fleet.name} would exceed the "
+                        f"{UNITS_PER_FLEET}-unit limit"
+                    )
+                )
+
+            continuing_projected_count = (
+                source_projected_count
+                if order.continuing_fleet_id == fleet.id
+                else transfer_projected_count
+            )
+
+            if continuing_projected_count <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="The continuing fleet must contain at least one unit"
+                )
+
+            continuing_fleet = (
+                fleet
+                if order.continuing_fleet_id == fleet.id
+                else transfer_fleet
+            )
+
+            participating_fleet_ids.add(transfer_fleet.id)
+
         participating_fleet_ids.add(fleet.id)
 
         resolved_orders.append({
@@ -2900,14 +4072,605 @@ def issue_fleet_command(
             ),
             "transfer_fleet": transfer_fleet,
             "transfer_fleet_move_step": transfer_fleet_move_step,
+            "continuing_fleet": continuing_fleet,
+            "target_fleet": target_fleet,
             "unit_ids_to_transfer_fleet": unit_ids_to_transfer_fleet,
-            "unit_ids_to_command_fleet": unit_ids_to_command_fleet
+            "unit_ids_to_command_fleet": unit_ids_to_command_fleet,
+            "retreat": retreat_report,
+            "hostile_entry": hostile_entry
         })
 
     command_report = []
 
     for resolved_order in resolved_orders:
         fleet = resolved_order["fleet"]
+
+
+        if resolved_order["order_type"] == FLEET_ORDER_DEFEND:
+            fleet.is_defensive = True
+            fleet.has_acted_this_round = True
+
+            command_report.append({
+                "fleet_id": fleet.id,
+                "fleet_name": fleet.name,
+                "order_type": resolved_order["order_type"],
+                "steps": [],
+                "final_system_id": fleet.system_id,
+                "final_system_name": resolved_order["final_system_name"],
+                "total_danger_cards": 0,
+                "is_defensive": True,
+                "fleet_destroyed": False,
+                "order_completed": True,
+                "transfer": None,
+                "split": None,
+                "retreat": None,
+                "combat": None
+            })
+            continue
+
+        if resolved_order["order_type"] == FLEET_ORDER_CONTINUE_COMBAT:
+            target_fleet = resolved_order["target_fleet"]
+            combat_result = resolve_single_combat_exchange(
+                db=db,
+                session_id=session_id,
+                attacker=fleet,
+                defender=target_fleet
+            )
+            attacker_destroyed = combat_result["attacker_destroyed"]
+            defender_destroyed = combat_result["defender_destroyed"]
+
+            if defender_destroyed:
+                delete_fleet_if_empty(db, session_id, target_fleet.id)
+            if attacker_destroyed:
+                delete_fleet_if_empty(db, session_id, fleet.id)
+            else:
+                fleet.has_acted_this_round = True
+                fleet.is_defensive = False
+
+            hostile_fleets_remaining = 0
+            if not attacker_destroyed:
+                hostile_fleets_remaining = db.query(SessionFleet).filter(
+                    SessionFleet.session_id == session_id,
+                    SessionFleet.system_id == fleet.system_id,
+                    SessionFleet.owner_player_id != acting_player.id
+                ).count()
+
+            combat_report = {
+                "defender_fleet_id": target_fleet.id,
+                "defender_fleet_name": target_fleet.name,
+                "defender_owner_player_id": target_fleet.owner_player_id,
+                "defender_was_defensive": False,
+                "defensive_position_consumed": False,
+                "ambush_cards": [],
+                "rounds": combat_result["rounds"],
+                "exchange": combat_result["exchange"],
+                "outcome": combat_result["outcome"],
+                "attacker_destroyed": attacker_destroyed,
+                "defender_destroyed": defender_destroyed,
+                "engagement_continues": combat_result["engagement_continues"],
+                "attacker_retreat": False,
+                "retreat_reason": None,
+                "attacker_retreat_system_id": None,
+                "attacker_retreat_system_name": None,
+                "hostile_fleets_remaining": hostile_fleets_remaining
+            }
+
+            command_report.append({
+                "fleet_id": fleet.id,
+                "fleet_name": fleet.name,
+                "order_type": resolved_order["order_type"],
+                "steps": [],
+                "final_system_id": resolved_order["final_system_id"],
+                "final_system_name": resolved_order["final_system_name"],
+                "total_danger_cards": 0,
+                "is_defensive": False,
+                "fleet_destroyed": attacker_destroyed,
+                "order_completed": True,
+                "transfer": None,
+                "split": None,
+                "retreat": None,
+                "combat": combat_report
+            })
+            continue
+
+        if resolved_order["order_type"] == FLEET_ORDER_SPLIT_MOVE:
+            source_fleet_id = fleet.id
+            source_fleet_name = fleet.name
+            original_system_id = fleet.system_id
+            original_system = db.query(StarSystem).filter(
+                StarSystem.id == original_system_id
+            ).first()
+
+            source_units_by_id = {
+                unit.id: unit
+                for unit in get_fleet_units(
+                    db=db,
+                    session_id=session_id,
+                    fleet_id=source_fleet_id
+                )
+            }
+            moved_units = [
+                source_units_by_id[unit_id]
+                for unit_id in resolved_order["split_unit_ids"]
+            ]
+
+            new_fleet_number = get_next_fleet_number(
+                db=db,
+                session_id=session_id,
+                owner_player_id=acting_player.id
+            )
+            new_fleet = SessionFleet(
+                session_id=session_id,
+                owner_player_id=acting_player.id,
+                system_id=original_system_id,
+                fleet_number=new_fleet_number,
+                name=f"Fleet {new_fleet_number}",
+                is_defensive=False,
+                has_acted_this_round=False
+            )
+            db.add(new_fleet)
+            db.flush()
+
+            for unit in moved_units:
+                unit.fleet_id = new_fleet.id
+                unit.system_id = original_system_id
+
+            fleet.is_defensive = False
+            db.flush()
+            normalize_fleet_unit_slots(db, session_id, source_fleet_id)
+            normalize_fleet_unit_slots(db, session_id, new_fleet.id)
+            db.flush()
+
+            def resolve_split_movement(
+                moving_fleet: SessionFleet,
+                planned_step: dict | None
+            ) -> tuple[dict | None, bool, int, str | None]:
+                if planned_step is None:
+                    current_system = db.query(StarSystem).filter(
+                        StarSystem.id == moving_fleet.system_id
+                    ).first()
+                    return (
+                        None,
+                        False,
+                        moving_fleet.system_id,
+                        current_system.name if current_system else None
+                    )
+
+                target_system_id = planned_step["to_system_id"]
+                moving_fleet.system_id = target_system_id
+                db.query(SessionUnit).filter(
+                    SessionUnit.session_id == session_id,
+                    SessionUnit.fleet_id == moving_fleet.id
+                ).update(
+                    {SessionUnit.system_id: target_system_id},
+                    synchronize_session=False
+                )
+
+                drawn_cards = resolve_danger_cards(
+                    db=db,
+                    session_id=session_id,
+                    fleet=moving_fleet,
+                    acting_player=acting_player,
+                    cards_count=planned_step["danger_cards"]
+                )
+                movement_report = {
+                    **planned_step,
+                    "drawn_cards": drawn_cards
+                }
+                destroyed = (
+                    count_fleet_units(
+                        db,
+                        session_id,
+                        moving_fleet.id
+                    ) == 0
+                )
+                return (
+                    movement_report,
+                    destroyed,
+                    target_system_id,
+                    planned_step["to_system_name"]
+                )
+
+            source_movement_report, source_destroyed, source_final_system_id, source_final_system_name = resolve_split_movement(
+                fleet,
+                resolved_order["split_source_move_step"]
+            )
+            new_movement_report, new_fleet_destroyed, new_final_system_id, new_final_system_name = resolve_split_movement(
+                new_fleet,
+                resolved_order["split_new_fleet_move_step"]
+            )
+
+            if not source_destroyed:
+                fleet.has_acted_this_round = True
+            if not new_fleet_destroyed:
+                new_fleet.has_acted_this_round = True
+
+            if source_destroyed:
+                delete_fleet_if_empty(db, session_id, source_fleet_id)
+            if new_fleet_destroyed:
+                delete_fleet_if_empty(db, session_id, new_fleet.id)
+
+            db.flush()
+
+            movement_steps = [
+                step
+                for step in [source_movement_report, new_movement_report]
+                if step is not None
+            ]
+            split_report = {
+                "new_fleet_id": new_fleet.id,
+                "new_fleet_number": new_fleet_number,
+                "new_fleet_name": new_fleet.name,
+                "moved_to_new_fleet": [
+                    get_transfer_unit_summary(unit)
+                    for unit in moved_units
+                ],
+                "source_movement_used": source_movement_report is not None,
+                "source_movement_step": source_movement_report,
+                "source_final_system_id": source_final_system_id,
+                "source_final_system_name": source_final_system_name,
+                "source_fleet_destroyed": source_destroyed,
+                "new_fleet_movement_used": new_movement_report is not None,
+                "new_fleet_movement_step": new_movement_report,
+                "new_fleet_final_system_id": new_final_system_id,
+                "new_fleet_final_system_name": new_final_system_name,
+                "new_fleet_destroyed": new_fleet_destroyed,
+                "completed": not source_destroyed and not new_fleet_destroyed
+            }
+
+            command_report.append({
+                "fleet_id": source_fleet_id,
+                "fleet_name": source_fleet_name,
+                "order_type": resolved_order["order_type"],
+                "steps": movement_steps,
+                "final_system_id": source_final_system_id,
+                "final_system_name": source_final_system_name,
+                "total_danger_cards": sum(
+                    len(step["drawn_cards"])
+                    for step in movement_steps
+                ),
+                "is_defensive": False,
+                "fleet_destroyed": source_destroyed,
+                "order_completed": split_report["completed"],
+                "transfer": None,
+                "split": split_report,
+                "retreat": None,
+                "combat": None
+            })
+            continue
+
+
+        if resolved_order["order_type"] == FLEET_ORDER_MOVE_ATTACK:
+            target_fleet = resolved_order["target_fleet"]
+            planned_step = resolved_order["steps"][0]
+            target_system_id = planned_step["to_system_id"]
+
+            fleet.system_id = target_system_id
+            fleet.is_defensive = False
+            db.query(SessionUnit).filter(
+                SessionUnit.session_id == session_id,
+                SessionUnit.fleet_id == fleet.id
+            ).update(
+                {SessionUnit.system_id: target_system_id},
+                synchronize_session=False
+            )
+
+            movement_cards = resolve_danger_cards(
+                db=db,
+                session_id=session_id,
+                fleet=fleet,
+                acting_player=acting_player,
+                cards_count=planned_step["danger_cards"]
+            )
+            movement_report = {
+                **planned_step,
+                "drawn_cards": movement_cards
+            }
+
+            attacker_destroyed_in_transit = (
+                count_fleet_units(db, session_id, fleet.id) == 0
+            )
+            defender_was_defensive = bool(target_fleet.is_defensive)
+            ambush_cards: list[dict] = []
+            combat_rounds: list[dict] = []
+            combat_exchange = None
+            outcome = "attacker_destroyed_in_transit"
+            defender_destroyed = False
+            attacker_destroyed = attacker_destroyed_in_transit
+            engagement_continues = False
+            hostile_fleets_remaining = 0
+
+            if attacker_destroyed_in_transit:
+                delete_fleet_if_empty(db, session_id, fleet.id)
+            else:
+                if defender_was_defensive:
+                    ambush_cards = resolve_danger_cards(
+                        db=db,
+                        session_id=session_id,
+                        fleet=fleet,
+                        acting_player=acting_player,
+                        cards_count=1
+                    )
+                    target_fleet.is_defensive = False
+
+                attacker_destroyed = (
+                    count_fleet_units(db, session_id, fleet.id) == 0
+                )
+
+                if attacker_destroyed:
+                    outcome = "attacker_destroyed_by_ambush"
+                    delete_fleet_if_empty(db, session_id, fleet.id)
+                else:
+                    combat_result = resolve_single_combat_exchange(
+                        db=db,
+                        session_id=session_id,
+                        attacker=fleet,
+                        defender=target_fleet
+                    )
+                    combat_rounds = combat_result["rounds"]
+                    combat_exchange = combat_result["exchange"]
+                    outcome = combat_result["outcome"]
+                    attacker_destroyed = combat_result["attacker_destroyed"]
+                    defender_destroyed = combat_result["defender_destroyed"]
+                    engagement_continues = combat_result[
+                        "engagement_continues"
+                    ]
+
+                    if (
+                        defender_was_defensive
+                        and engagement_continues
+                        and not defender_destroyed
+                    ):
+                        target_fleet.has_acted_this_round = False
+
+                    if defender_destroyed:
+                        delete_fleet_if_empty(db, session_id, target_fleet.id)
+                    if attacker_destroyed:
+                        delete_fleet_if_empty(db, session_id, fleet.id)
+                    else:
+                        fleet.has_acted_this_round = True
+                        hostile_fleets_remaining = db.query(SessionFleet).filter(
+                            SessionFleet.session_id == session_id,
+                            SessionFleet.system_id == target_system_id,
+                            SessionFleet.owner_player_id != acting_player.id
+                        ).count()
+
+            combat_report = {
+                "defender_fleet_id": target_fleet.id,
+                "defender_fleet_name": target_fleet.name,
+                "defender_owner_player_id": target_fleet.owner_player_id,
+                "defender_was_defensive": defender_was_defensive,
+                "defensive_position_consumed": defender_was_defensive,
+                "ambush_cards": ambush_cards,
+                "rounds": combat_rounds,
+                "exchange": combat_exchange,
+                "outcome": outcome,
+                "attacker_destroyed": attacker_destroyed,
+                "defender_destroyed": defender_destroyed,
+                "engagement_continues": engagement_continues,
+                "defender_response_ready": (
+                    defender_was_defensive
+                    and engagement_continues
+                    and not defender_destroyed
+                ),
+                "attacker_retreat": False,
+                "retreat_reason": None,
+                "attacker_retreat_system_id": None,
+                "attacker_retreat_system_name": None,
+                "hostile_fleets_remaining": hostile_fleets_remaining
+            }
+
+            command_report.append({
+                "fleet_id": fleet.id,
+                "fleet_name": fleet.name,
+                "order_type": resolved_order["order_type"],
+                "steps": [movement_report],
+                "final_system_id": target_system_id,
+                "final_system_name": planned_step["to_system_name"],
+                "total_danger_cards": (
+                    len(movement_cards) + len(ambush_cards)
+                ),
+                "is_defensive": False,
+                "fleet_destroyed": attacker_destroyed,
+                "order_completed": True,
+                "transfer": None,
+                "split": None,
+                "retreat": None,
+                "combat": combat_report
+            })
+            continue
+
+        if resolved_order["order_type"] == FLEET_ORDER_TRANSFER_MOVE:
+            transfer_fleet = resolved_order["transfer_fleet"]
+            continuing_fleet = resolved_order["continuing_fleet"]
+            planned_step = resolved_order["steps"][0]
+            source_fleet_id = fleet.id
+            source_fleet_name = fleet.name
+            partner_fleet_id = transfer_fleet.id
+            partner_fleet_name = transfer_fleet.name
+
+            source_units = {
+                unit.id: unit
+                for unit in get_fleet_units(
+                    db=db,
+                    session_id=session_id,
+                    fleet_id=source_fleet_id
+                )
+            }
+            partner_units = {
+                unit.id: unit
+                for unit in get_fleet_units(
+                    db=db,
+                    session_id=session_id,
+                    fleet_id=partner_fleet_id
+                )
+            }
+
+            moved_to_partner = [
+                source_units[unit_id]
+                for unit_id in resolved_order[
+                    "unit_ids_to_transfer_fleet"
+                ]
+            ]
+            moved_to_command = [
+                partner_units[unit_id]
+                for unit_id in resolved_order[
+                    "unit_ids_to_command_fleet"
+                ]
+            ]
+
+            for unit in moved_to_partner:
+                unit.fleet_id = partner_fleet_id
+
+            for unit in moved_to_command:
+                unit.fleet_id = source_fleet_id
+
+            fleet.is_defensive = False
+            transfer_fleet.is_defensive = False
+            db.flush()
+
+            normalize_fleet_unit_slots(db, session_id, source_fleet_id)
+            normalize_fleet_unit_slots(db, session_id, partner_fleet_id)
+            db.flush()
+
+            source_empty_after_transfer = (
+                count_fleet_units(db, session_id, source_fleet_id) == 0
+            )
+            partner_empty_after_transfer = (
+                count_fleet_units(db, session_id, partner_fleet_id) == 0
+            )
+
+            continuing_fleet_id = continuing_fleet.id
+            continuing_fleet_name = continuing_fleet.name
+            movement_target_system_id = planned_step["to_system_id"]
+
+            continuing_fleet.system_id = movement_target_system_id
+            db.query(SessionUnit).filter(
+                SessionUnit.session_id == session_id,
+                SessionUnit.fleet_id == continuing_fleet_id
+            ).update(
+                {SessionUnit.system_id: movement_target_system_id},
+                synchronize_session=False
+            )
+
+            drawn_cards = resolve_danger_cards(
+                db=db,
+                session_id=session_id,
+                fleet=continuing_fleet,
+                acting_player=acting_player,
+                cards_count=planned_step["danger_cards"]
+            )
+
+            movement_step_report = {
+                **planned_step,
+                "drawn_cards": drawn_cards
+            }
+
+            continuing_destroyed = (
+                count_fleet_units(
+                    db, session_id, continuing_fleet_id
+                ) == 0
+            )
+
+            source_deleted = source_empty_after_transfer
+            partner_deleted = partner_empty_after_transfer
+
+            if continuing_destroyed:
+                if continuing_fleet_id == source_fleet_id:
+                    source_deleted = True
+                else:
+                    partner_deleted = True
+
+            if not source_deleted:
+                fleet.has_acted_this_round = True
+
+            if not partner_deleted:
+                transfer_fleet.has_acted_this_round = True
+
+            transfer_report = {
+                "partner_fleet_id": partner_fleet_id,
+                "partner_fleet_name": partner_fleet_name,
+                "moved_to_partner": [
+                    get_transfer_unit_summary(unit)
+                    for unit in moved_to_partner
+                ],
+                "moved_to_command_fleet": [
+                    get_transfer_unit_summary(unit)
+                    for unit in moved_to_command
+                ],
+                "missing_unit_ids": [],
+                "source_fleet_deleted": source_deleted,
+                "partner_fleet_deleted": partner_deleted,
+                "partner_movement_available": (
+                    continuing_fleet_id == partner_fleet_id
+                ),
+                "partner_movement_used": (
+                    continuing_fleet_id == partner_fleet_id
+                ),
+                "partner_movement_step": (
+                    movement_step_report
+                    if continuing_fleet_id == partner_fleet_id
+                    else None
+                ),
+                "partner_final_system_id": (
+                    movement_target_system_id
+                    if continuing_fleet_id == partner_fleet_id
+                    else transfer_fleet.system_id
+                ),
+                "partner_final_system_name": (
+                    planned_step["to_system_name"]
+                    if continuing_fleet_id == partner_fleet_id
+                    else (
+                        db.query(StarSystem).filter(
+                            StarSystem.id == transfer_fleet.system_id
+                        ).first().name
+                        if db.query(StarSystem).filter(
+                            StarSystem.id == transfer_fleet.system_id
+                        ).first()
+                        else None
+                    )
+                ),
+                "partner_fleet_destroyed": (
+                    continuing_destroyed
+                    and continuing_fleet_id == partner_fleet_id
+                ),
+                "continuing_fleet_id": continuing_fleet_id,
+                "continuing_fleet_name": continuing_fleet_name,
+                "continuing_movement_used": True,
+                "continuing_movement_step": movement_step_report,
+                "continuing_final_system_id": movement_target_system_id,
+                "continuing_final_system_name": planned_step[
+                    "to_system_name"
+                ],
+                "continuing_fleet_destroyed": continuing_destroyed,
+                "completed": not continuing_destroyed
+            }
+
+            if source_deleted:
+                delete_fleet_if_empty(db, session_id, source_fleet_id)
+
+            if partner_deleted:
+                delete_fleet_if_empty(db, session_id, partner_fleet_id)
+
+            db.flush()
+
+            command_report.append({
+                "fleet_id": source_fleet_id,
+                "fleet_name": source_fleet_name,
+                "order_type": resolved_order["order_type"],
+                "steps": [movement_step_report],
+                "final_system_id": movement_target_system_id,
+                "final_system_name": planned_step["to_system_name"],
+                "total_danger_cards": len(drawn_cards),
+                "is_defensive": False,
+                "fleet_destroyed": continuing_destroyed,
+                "order_completed": not continuing_destroyed,
+                "transfer": transfer_report,
+                "split": None,
+                "retreat": None,
+                "combat": None
+            })
+            continue
         fleet_id = fleet.id
         fleet_name = fleet.name
         completed_steps = []
@@ -2945,6 +4708,83 @@ def issue_fleet_command(
                 db.delete(fleet)
                 db.flush()
                 break
+
+        interception_report = None
+        hostile_entry = resolved_order.get("hostile_entry")
+
+        if (
+            not fleet_destroyed
+            and len(completed_steps) == len(resolved_order["steps"])
+            and resolved_order["order_type"] == FLEET_ORDER_MOVE_MOVE
+            and hostile_entry is not None
+        ):
+            interceptor = hostile_entry.get("interceptor")
+            interceptor_still_present = (
+                interceptor is not None
+                and db.query(SessionFleet).filter(
+                    SessionFleet.id == interceptor.id,
+                    SessionFleet.session_id == session_id,
+                    SessionFleet.system_id == fleet.system_id
+                ).first() is not None
+                and count_fleet_units(db, session_id, interceptor.id) > 0
+            )
+
+            strike = None
+            if interceptor_still_present:
+                strike = resolve_one_way_interception(
+                    db=db,
+                    session_id=session_id,
+                    moving_fleet=fleet,
+                    interceptor=interceptor
+                )
+                fleet_destroyed = strike["moving_fleet_destroyed"]
+                if fleet_destroyed:
+                    delete_fleet_if_empty(db, session_id, fleet.id)
+
+            interception_report = {
+                "interception_step": hostile_entry.get("step_number", 2),
+                "movement_ended_early": hostile_entry.get(
+                    "movement_ended_early",
+                    False
+                ),
+                "hostile_controlled": hostile_entry["hostile_controlled"],
+                "destination_owner_player_id": hostile_entry[
+                    "destination_owner_player_id"
+                ],
+                "destination_owner_name": hostile_entry[
+                    "destination_owner_name"
+                ],
+                "interceptor_fleet_id": (
+                    interceptor.id if interceptor_still_present else None
+                ),
+                "interceptor_fleet_name": (
+                    interceptor.name if interceptor_still_present else None
+                ),
+                "interceptor_owner_player_id": (
+                    interceptor.owner_player_id
+                    if interceptor_still_present
+                    else None
+                ),
+                "interceptor_owner_name": (
+                    hostile_entry["interceptor_owner_name"]
+                    if interceptor_still_present
+                    else None
+                ),
+                "interceptor_was_defensive": (
+                    bool(interceptor.is_defensive)
+                    if interceptor_still_present
+                    else False
+                ),
+                "attack_power": strike["attack_power"] if strike else 0,
+                "target_defense": strike["target_defense"] if strike else 0,
+                "damage": strike["damage"] if strike else 0,
+                "damage_events": strike["damage_events"] if strike else [],
+                "moving_fleet_destroyed": fleet_destroyed,
+                "engagement_created": (
+                    interceptor_still_present and not fleet_destroyed
+                ),
+                "no_return_fire": True
+            }
 
         final_step = completed_steps[-1]
         final_system_id = final_step["to_system_id"]
@@ -3199,14 +5039,33 @@ def issue_fleet_command(
             "is_defensive": is_defensive,
             "fleet_destroyed": fleet_destroyed,
             "order_completed": order_completed,
-            "transfer": transfer_report
+            "transfer": transfer_report,
+            "split": None,
+            "retreat": resolved_order.get("retreat"),
+            "combat": None,
+            "interception": interception_report
         })
+
+    action_round = game_session.current_round
 
     consume_command_point_and_advance_turn(
         session=game_session,
         players=players,
         acting_player=acting_player,
         db=db
+    )
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="fleet_command_resolved",
+        actor=acting_player,
+        payload={
+            "command_points_spent": 1,
+            "orders": command_report,
+            "next_player_id": game_session.current_player_id
+        },
+        round_number=action_round
     )
 
     db.commit()
@@ -3242,6 +5101,13 @@ def finish_session(
     game_session.status = "finished"
     game_session.round_phase = "finished"
     game_session.current_player_id = None
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="game_finished",
+        payload={}
+    )
 
     db.commit()
     db.refresh(game_session)
