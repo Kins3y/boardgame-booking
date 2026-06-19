@@ -18,6 +18,11 @@ from app.game.models.session_system import SessionSystem
 from app.game.models.session_building import SessionBuilding
 from app.game.models.civilization import Civilization
 from app.game.models.session_unit import SessionUnit
+from app.game.models.session_fleet import SessionFleet
+from app.game.models.session_game_log import SessionGameLog
+from app.game.models.session_player_technology import SessionPlayerTechnology
+from app.game.models.session_player_blueprint import SessionPlayerBlueprint
+from app.game.models.session_archon_core_claim import SessionArchonCoreClaim
 
 from app.game.api.star_systems import router as star_system_router
 from app.game.api.system_connections import router as system_connection_router

@@ -3,6 +3,7 @@ import random
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.db.database import SessionLocal
 from app.game.models.civilization import Civilization
@@ -14,12 +15,18 @@ from app.game.models.session_system import SessionSystem
 from app.game.models.session_unit import SessionUnit
 from app.game.models.session_fleet import SessionFleet
 from app.game.models.session_game_log import SessionGameLog
+from app.game.models.session_player_technology import SessionPlayerTechnology
+from app.game.models.session_player_blueprint import SessionPlayerBlueprint
+from app.game.models.session_archon_core_claim import SessionArchonCoreClaim
 from app.game.models.star_system import StarSystem
 from app.game.models.system_connection import SystemConnection
 from app.game.schemas.game_session import GameSessionCreate
 from app.game.schemas.game_session import GameSessionUpdateName
 from app.game.schemas.session_player import SessionPlayerCreate
 from app.game.schemas.start_system import StartSystemOptionResponse
+from app.game.schemas.technology import TechnologyResearchRequest
+from app.game.schemas.archive_research import ArchiveResearchRequest
+from app.game.schemas.archon_core import ArchonCoreClaimRequest
 from app.game.services.map_validator import validate_map
 from app.game.services.game_log_service import create_game_log
 from app.models.user import User
@@ -27,6 +34,111 @@ from app.models.user import User
 
 
 COMMAND_POINTS_PER_ROUND = 3
+MAX_GAME_ROUNDS = 12
+
+TECHNOLOGY_CATALOG = [
+    {
+        "key": "marine_reinforced_armor",
+        "name": "Reinforced Marine Armor",
+        "category": "combat",
+        "building_type": "barracks",
+        "building_name": "Barracks",
+        "cost": {"matter": 4, "energy": 2, "data": 1},
+        "effect_summary": "Marine squads gain +1 max HP in future combat calculations.",
+        "description": "Standardizes heavier armor plates for boarding and ground squads.",
+        "dominance_points": 1,
+    },
+    {
+        "key": "frigate_targeting_protocol",
+        "name": "Frigate Targeting Protocol",
+        "category": "combat",
+        "building_type": "spaceport",
+        "building_name": "Spaceport",
+        "cost": {"matter": 3, "energy": 3, "data": 2},
+        "effect_summary": "Frigates gain +1 attack in future combat calculations.",
+        "description": "Calibrates medium-ship targeting arrays for faster first-contact fire.",
+        "dominance_points": 1,
+    },
+    {
+        "key": "archive_decoding",
+        "name": "Archive Decoding",
+        "category": "archive",
+        "building_type": "research_center",
+        "building_name": "Research Center",
+        "cost": {"matter": 2, "energy": 2, "data": 3},
+        "effect_summary": "Archive research actions will cost -1 Energy once archive research is implemented.",
+        "description": "Builds a translation layer for hostile archive languages and broken Archon diagrams.",
+        "dominance_points": 1,
+    },
+    {
+        "key": "supply_chain_stabilizers",
+        "name": "Supply Chain Stabilizers",
+        "category": "logistics",
+        "building_type": "storage",
+        "building_name": "Supply Depot",
+        "cost": {"matter": 3, "energy": 2, "data": 1},
+        "effect_summary": "Future logistics upgrades may reduce retreat and danger-card penalties.",
+        "description": "Improves fleet reserve routing and stabilizes supply movement during crisis maneuvers.",
+        "dominance_points": 1,
+    },
+]
+
+TECHNOLOGY_BY_KEY = {
+    technology["key"]: technology
+    for technology in TECHNOLOGY_CATALOG
+}
+
+ARCHIVE_BLUEPRINT_DP = 2
+ARCHIVE_RESEARCH_BASE_ENERGY_COST = 3
+ARCHIVE_RESEARCH_DECODING_DISCOUNT = 1
+ARCHIVE_RESEARCH_DATA_REWARD = 1
+ARCHIVE_RESEARCH_REPEAT_DATA_REWARD = 3
+ARCHON_BLUEPRINTS_REQUIRED = 5
+ARCHON_CORE_CLAIM_COMMAND_POINT_COST = 1
+ARCHON_CORE_SESSION_STATUS = "archon_activated"
+
+ARCHON_BLUEPRINT_CATALOG = [
+    {
+        "level": 1,
+        "key": "archon_blueprint_i",
+        "name": "Blueprint I",
+        "archive_label": "Archive I",
+        "dominance_points": ARCHIVE_BLUEPRINT_DP,
+    },
+    {
+        "level": 2,
+        "key": "archon_blueprint_ii",
+        "name": "Blueprint II",
+        "archive_label": "Archive II",
+        "dominance_points": ARCHIVE_BLUEPRINT_DP,
+    },
+    {
+        "level": 3,
+        "key": "archon_blueprint_iii",
+        "name": "Blueprint III",
+        "archive_label": "Archive III",
+        "dominance_points": ARCHIVE_BLUEPRINT_DP,
+    },
+    {
+        "level": 4,
+        "key": "archon_blueprint_iv",
+        "name": "Blueprint IV",
+        "archive_label": "Archive IV",
+        "dominance_points": ARCHIVE_BLUEPRINT_DP,
+    },
+    {
+        "level": 5,
+        "key": "archon_blueprint_v",
+        "name": "Blueprint V",
+        "archive_label": "Archive V",
+        "dominance_points": ARCHIVE_BLUEPRINT_DP,
+    },
+]
+
+ARCHON_BLUEPRINT_BY_LEVEL = {
+    blueprint["level"]: blueprint
+    for blueprint in ARCHON_BLUEPRINT_CATALOG
+}
 
 DEPLOYED_COLONY_INCOME = {
     "matter": 2,
@@ -403,6 +515,382 @@ BUILDING_INCOME = {
         "food": 0
     }
 }
+
+
+def get_researched_technology_keys(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> set[str]:
+    researched_technologies = db.query(SessionPlayerTechnology).filter(
+        SessionPlayerTechnology.session_id == session_id,
+        SessionPlayerTechnology.player_id == player_id
+    ).all()
+
+    return {
+        str(researched_technology.technology_key)
+        for researched_technology in researched_technologies
+    }
+
+
+def serialize_technology(technology: dict) -> dict:
+    return {
+        "key": technology["key"],
+        "name": technology["name"],
+        "category": technology["category"],
+        "building_type": technology["building_type"],
+        "building_name": technology["building_name"],
+        "cost": technology["cost"],
+        "effect_summary": technology["effect_summary"],
+        "description": technology["description"],
+        "dominance_points": technology["dominance_points"],
+    }
+
+
+def get_player_technologies_response(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> list[dict]:
+    researched_keys = get_researched_technology_keys(
+        db=db,
+        session_id=session_id,
+        player_id=player_id
+    )
+
+    return [
+        serialize_technology(TECHNOLOGY_BY_KEY[technology_key])
+        for technology_key in sorted(researched_keys)
+        if technology_key in TECHNOLOGY_BY_KEY
+    ]
+
+
+def serialize_archon_blueprint_catalog_item(blueprint: dict) -> dict:
+    return {
+        "level": blueprint["level"],
+        "key": blueprint["key"],
+        "name": blueprint["name"],
+        "archive_label": blueprint["archive_label"],
+        "dominance_points": blueprint["dominance_points"],
+    }
+
+
+def serialize_player_blueprint(blueprint: SessionPlayerBlueprint) -> dict:
+    blueprint_definition = ARCHON_BLUEPRINT_BY_LEVEL.get(
+        blueprint.blueprint_level,
+        {
+            "level": blueprint.blueprint_level,
+            "key": blueprint.blueprint_key,
+            "name": f"Blueprint {blueprint.blueprint_level}",
+            "archive_label": f"Archive {blueprint.blueprint_level}",
+            "dominance_points": ARCHIVE_BLUEPRINT_DP,
+        }
+    )
+
+    return {
+        "id": blueprint.id,
+        "level": blueprint.blueprint_level,
+        "key": blueprint.blueprint_key,
+        "name": blueprint_definition["name"],
+        "archive_label": blueprint_definition["archive_label"],
+        "archive_system_id": blueprint.archive_system_id,
+        "discovered_round": blueprint.discovered_round,
+        "dominance_points": blueprint_definition["dominance_points"],
+    }
+
+
+def get_player_blueprints(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> list[SessionPlayerBlueprint]:
+    return db.query(SessionPlayerBlueprint).filter(
+        SessionPlayerBlueprint.session_id == session_id,
+        SessionPlayerBlueprint.player_id == player_id
+    ).order_by(
+        SessionPlayerBlueprint.blueprint_level.asc(),
+        SessionPlayerBlueprint.id.asc()
+    ).all()
+
+
+def get_player_blueprint_levels(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> set[int]:
+    return {
+        int(blueprint.blueprint_level)
+        for blueprint in get_player_blueprints(
+            db=db,
+            session_id=session_id,
+            player_id=player_id
+        )
+    }
+
+
+def get_player_blueprints_response(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> list[dict]:
+    return [
+        serialize_player_blueprint(blueprint)
+        for blueprint in get_player_blueprints(
+            db=db,
+            session_id=session_id,
+            player_id=player_id
+        )
+    ]
+
+
+def player_has_all_archon_blueprints(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> bool:
+    return len(get_player_blueprint_levels(
+        db=db,
+        session_id=session_id,
+        player_id=player_id
+    )) >= ARCHON_BLUEPRINTS_REQUIRED
+
+
+def get_archon_core_claim(
+    db: Session,
+    session_id: int
+) -> SessionArchonCoreClaim | None:
+    return db.query(SessionArchonCoreClaim).filter(
+        SessionArchonCoreClaim.session_id == session_id
+    ).first()
+
+
+def get_heart_of_the_galaxy_systems(
+    db: Session,
+    session_id: int
+) -> list[tuple[SessionSystem, StarSystem]]:
+    rows = db.query(SessionSystem, StarSystem).join(
+        StarSystem,
+        StarSystem.id == SessionSystem.system_id
+    ).filter(
+        SessionSystem.session_id == session_id,
+        StarSystem.system_type == "archive",
+        StarSystem.archive_level == 5
+    ).all()
+
+    return rows
+
+
+def get_controlled_heart_system(
+    db: Session,
+    session_id: int,
+    player_id: int,
+    requested_system_id: int | None = None
+) -> tuple[SessionSystem, StarSystem] | None:
+    rows = get_heart_of_the_galaxy_systems(
+        db=db,
+        session_id=session_id
+    )
+
+    for session_system, star_system in rows:
+        if requested_system_id is not None and star_system.id != requested_system_id:
+            continue
+
+        if session_system.owner_player_id == player_id:
+            return session_system, star_system
+
+    return None
+
+
+def serialize_archon_core_claim(
+    db: Session,
+    claim: SessionArchonCoreClaim | None
+) -> dict | None:
+    if not claim:
+        return None
+
+    player = db.query(SessionPlayer).filter(
+        SessionPlayer.id == claim.player_id
+    ).first()
+
+    core_system = db.query(StarSystem).filter(
+        StarSystem.id == claim.core_system_id
+    ).first() if claim.core_system_id is not None else None
+
+    return {
+        "id": claim.id,
+        "session_id": claim.session_id,
+        "player_id": claim.player_id,
+        "player_faction": player.faction_name if player else None,
+        "core_system_id": claim.core_system_id,
+        "core_system_name": core_system.name if core_system else None,
+        "claimed_round": claim.claimed_round,
+    }
+
+
+def get_archon_victory_framework_response(
+    db: Session,
+    game_session: GameSession
+) -> dict:
+    core_claim = get_archon_core_claim(
+        db=db,
+        session_id=game_session.id
+    )
+    serialized_claim = serialize_archon_core_claim(
+        db=db,
+        claim=core_claim
+    )
+
+    archon_player_id = core_claim.player_id if core_claim else None
+    archon_player_faction = serialized_claim.get("player_faction") if serialized_claim else None
+
+    return {
+        "max_rounds": MAX_GAME_ROUNDS,
+        "fallback_victory": "dominance_points",
+        "archon_state": "activated" if core_claim else "inactive",
+        "core_state": "claimed" if core_claim else "unclaimed",
+        "archon_player_id": archon_player_id,
+        "archon_player_faction": archon_player_faction,
+        "archon_core_claim": serialized_claim,
+        "resistance_player_ids": [
+            player.id
+            for player in db.query(SessionPlayer).filter(
+                SessionPlayer.session_id == game_session.id
+            ).order_by(SessionPlayer.id.asc()).all()
+            if player.id != archon_player_id
+        ] if core_claim else [],
+    }
+
+
+def get_archive_research_energy_cost(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> int:
+    researched_keys = get_researched_technology_keys(
+        db=db,
+        session_id=session_id,
+        player_id=player_id
+    )
+
+    if "archive_decoding" in researched_keys:
+        return max(1, ARCHIVE_RESEARCH_BASE_ENERGY_COST - ARCHIVE_RESEARCH_DECODING_DISCOUNT)
+
+    return ARCHIVE_RESEARCH_BASE_ENERGY_COST
+
+
+def get_archive_research_shortage_message(
+    player: SessionPlayer,
+    energy_cost: int
+) -> str | None:
+    if player.energy >= energy_cost:
+        return None
+
+    return f"Not enough resources — ENG: need {energy_cost}, have {player.energy}"
+
+
+def get_player_dominance_points(
+    db: Session,
+    session_id: int,
+    player_id: int
+) -> int:
+    researched_keys = get_researched_technology_keys(
+        db=db,
+        session_id=session_id,
+        player_id=player_id
+    )
+
+    points = sum(
+        int(TECHNOLOGY_BY_KEY[technology_key].get("dominance_points", 0))
+        for technology_key in researched_keys
+        if technology_key in TECHNOLOGY_BY_KEY
+    )
+
+    archive_control_points = 0
+    controlled_archive_systems = db.query(SessionSystem).join(
+        StarSystem,
+        StarSystem.id == SessionSystem.system_id
+    ).filter(
+        SessionSystem.session_id == session_id,
+        SessionSystem.owner_player_id == player_id,
+        StarSystem.system_type == "archive"
+    ).all()
+
+    for session_system in controlled_archive_systems:
+        archive_system = db.query(StarSystem).filter(
+            StarSystem.id == session_system.system_id
+        ).first()
+
+        archive_level = archive_system.archive_level if archive_system else None
+        archive_control_points += 2 if archive_level in (4, 5) else 1
+
+    heart_points = db.query(SessionSystem).join(
+        StarSystem,
+        StarSystem.id == SessionSystem.system_id
+    ).filter(
+        SessionSystem.session_id == session_id,
+        SessionSystem.owner_player_id == player_id,
+        StarSystem.system_type == "archive",
+        StarSystem.archive_level == 5
+    ).count() * 3
+
+    blueprint_points = len(get_player_blueprint_levels(
+        db=db,
+        session_id=session_id,
+        player_id=player_id
+    )) * ARCHIVE_BLUEPRINT_DP
+
+    return points + archive_control_points + heart_points + blueprint_points
+
+
+def player_has_required_building(
+    db: Session,
+    session_id: int,
+    player_id: int,
+    building_type: str
+) -> bool:
+    return db.query(SessionBuilding).filter(
+        SessionBuilding.session_id == session_id,
+        SessionBuilding.owner_player_id == player_id,
+        SessionBuilding.building_type == building_type
+    ).first() is not None
+
+
+def apply_technology_cost(
+    player: SessionPlayer,
+    cost: dict
+):
+    player.matter -= int(cost.get("matter", 0) or 0)
+    player.energy -= int(cost.get("energy", 0) or 0)
+    player.data -= int(cost.get("data", 0) or 0)
+    player.food -= int(cost.get("food", 0) or 0)
+
+
+def get_technology_shortage_message(
+    player: SessionPlayer,
+    cost: dict
+) -> str | None:
+    missing_resources = []
+
+    resource_labels = {
+        "matter": "MAT",
+        "energy": "ENG",
+        "data": "DAT",
+        "food": "SUP",
+    }
+
+    for resource, label in resource_labels.items():
+        required = int(cost.get(resource, 0) or 0)
+        available = int(getattr(player, resource))
+
+        if required > available:
+            missing_resources.append(
+                f"{label}: need {required}, have {available}"
+            )
+
+    if not missing_resources:
+        return None
+
+    return "Not enough resources — " + ", ".join(missing_resources)
 
 
 def get_ordered_session_players(
@@ -1200,6 +1688,13 @@ def advance_turn_or_start_next_round(
         session.current_player_id = players[next_player_index].id
         return
 
+    if session.current_round >= MAX_GAME_ROUNDS:
+        session.status = "finished"
+        session.round_phase = "finished"
+        session.current_player_id = None
+        session.current_turn_index = 0
+        return
+
     if db is not None:
         build_income_report_and_apply_income(
             session_id=session.id,
@@ -1793,6 +2288,11 @@ def get_full_session(
         )
 
     players = get_ordered_session_players(db, session_id)
+    archon_core_claim = get_archon_core_claim(
+        db=db,
+        session_id=session_id
+    )
+    archon_player_id = archon_core_claim.player_id if archon_core_claim else None
 
     players_response = []
 
@@ -1888,6 +2388,29 @@ def get_full_session(
             "start_system_name": start_system.name if start_system else None,
             "command_points_left": player.command_points_left,
             "has_passed": player.has_passed,
+            "dominance_points": get_player_dominance_points(
+                db=db,
+                session_id=session_id,
+                player_id=player.id
+            ),
+            "technologies": get_player_technologies_response(
+                db=db,
+                session_id=session_id,
+                player_id=player.id
+            ),
+            "archon_blueprints": get_player_blueprints_response(
+                db=db,
+                session_id=session_id,
+                player_id=player.id
+            ),
+            "blueprint_count": len(get_player_blueprint_levels(
+                db=db,
+                session_id=session_id,
+                player_id=player.id
+            )),
+            "blueprints_required": ARCHON_BLUEPRINTS_REQUIRED,
+            "is_archon_player": archon_player_id == player.id,
+            "is_resistance_player": archon_player_id is not None and archon_player_id != player.id,
             "fleets": fleets_response
         })
 
@@ -1977,6 +2500,19 @@ def get_full_session(
         "name": game_session.name,
         "status": game_session.status,
         "current_round": game_session.current_round,
+        "max_rounds": MAX_GAME_ROUNDS,
+        "victory_framework": get_archon_victory_framework_response(
+            db=db,
+            game_session=game_session
+        ),
+        "technology_catalog": [
+            serialize_technology(technology)
+            for technology in TECHNOLOGY_CATALOG
+        ],
+        "archon_blueprint_catalog": [
+            serialize_archon_blueprint_catalog_item(blueprint)
+            for blueprint in ARCHON_BLUEPRINT_CATALOG
+        ],
         "play_mode": game_session.play_mode,
         "round_phase": game_session.round_phase,
         "current_player_id": game_session.current_player_id,
@@ -5074,6 +5610,508 @@ def issue_fleet_command(
         "message": "Fleet command resolved",
         "session": get_full_session(session_id, db),
         "command_report": command_report
+    }
+
+
+@router.post("/{session_id}/archives/research")
+def research_archive_blueprint(
+    session_id: int,
+    request: ArchiveResearchRequest,
+    db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "started":
+        raise HTTPException(
+            status_code=400,
+            detail="Archive research can only be performed in a started session"
+        )
+
+    players = get_ordered_session_players(db, session_id)
+
+    if not players:
+        raise HTTPException(
+            status_code=400,
+            detail="Session has no players"
+        )
+
+    current_player = get_current_player(
+        players,
+        game_session.current_player_id
+    )
+
+    if not current_player:
+        raise HTTPException(
+            status_code=400,
+            detail="No current player is active"
+        )
+
+    acting_player = require_current_player_for_action(
+        session=game_session,
+        players=players,
+        player_id=current_player.id
+    )
+
+    session_system = db.query(SessionSystem).filter(
+        SessionSystem.session_id == session_id,
+        SessionSystem.system_id == request.system_id
+    ).first()
+
+    if not session_system:
+        raise HTTPException(
+            status_code=404,
+            detail="Session system not found"
+        )
+
+    star_system = db.query(StarSystem).filter(
+        StarSystem.id == request.system_id
+    ).first()
+
+    if not star_system:
+        raise HTTPException(
+            status_code=404,
+            detail="Star system not found"
+        )
+
+    if star_system.system_type != "archive":
+        raise HTTPException(
+            status_code=400,
+            detail="Only archive systems can be researched"
+        )
+
+    archive_level = int(star_system.archive_level or 0)
+    blueprint_definition = ARCHON_BLUEPRINT_BY_LEVEL.get(archive_level)
+
+    if not blueprint_definition:
+        raise HTTPException(
+            status_code=400,
+            detail="Archive system must have level 1-5"
+        )
+
+    if session_system.owner_player_id != acting_player.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Current player must control this archive system"
+        )
+
+    discovered_levels = get_player_blueprint_levels(
+        db=db,
+        session_id=session_id,
+        player_id=acting_player.id
+    )
+    is_repeat_research = archive_level in discovered_levels
+
+    energy_cost = get_archive_research_energy_cost(
+        db=db,
+        session_id=session_id,
+        player_id=acting_player.id
+    )
+
+    shortage_message = get_archive_research_shortage_message(
+        player=acting_player,
+        energy_cost=energy_cost
+    )
+
+    if shortage_message:
+        raise HTTPException(
+            status_code=400,
+            detail=shortage_message
+        )
+
+    action_round = game_session.current_round
+    data_reward = (
+        ARCHIVE_RESEARCH_REPEAT_DATA_REWARD
+        if is_repeat_research
+        else ARCHIVE_RESEARCH_DATA_REWARD
+    )
+    dominance_points_reward = 0 if is_repeat_research else ARCHIVE_BLUEPRINT_DP
+
+    acting_player.energy -= energy_cost
+    acting_player.data += data_reward
+
+    if not is_repeat_research:
+        discovered_blueprint = SessionPlayerBlueprint(
+            session_id=session_id,
+            player_id=acting_player.id,
+            blueprint_level=blueprint_definition["level"],
+            blueprint_key=blueprint_definition["key"],
+            archive_system_id=star_system.id,
+            discovered_round=action_round
+        )
+        db.add(discovered_blueprint)
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type=(
+            "archive_data_extracted"
+            if is_repeat_research
+            else "archive_blueprint_discovered"
+        ),
+        actor=acting_player,
+        payload={
+            "system_id": star_system.id,
+            "system_name": star_system.name,
+            "archive_level": archive_level,
+            "blueprint": serialize_archon_blueprint_catalog_item(blueprint_definition),
+            "energy_cost": energy_cost,
+            "data_reward": data_reward,
+            "dominance_points": dominance_points_reward,
+            "is_repeat_research": is_repeat_research,
+        },
+        round_number=action_round
+    )
+
+    consume_command_point_and_advance_turn(
+        session=game_session,
+        players=players,
+        acting_player=acting_player,
+        db=db
+    )
+
+    db.commit()
+
+    return {
+        "message": (
+            "Archive data extracted"
+            if is_repeat_research
+            else "Archive blueprint discovered"
+        ),
+        "session": get_full_session(session_id, db),
+        "blueprint": serialize_archon_blueprint_catalog_item(blueprint_definition),
+        "is_repeat_research": is_repeat_research,
+        "data_reward": data_reward,
+        "dominance_points": dominance_points_reward,
+    }
+
+
+@router.post("/{session_id}/archon-core/claim")
+def claim_archon_core(
+    session_id: int,
+    request: ArchonCoreClaimRequest,
+    db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "started":
+        raise HTTPException(
+            status_code=400,
+            detail="Archon Core can only be claimed during a started session"
+        )
+
+    existing_claim = get_archon_core_claim(
+        db=db,
+        session_id=session_id
+    )
+
+    if existing_claim:
+        raise HTTPException(
+            status_code=400,
+            detail="Archon Core has already been claimed"
+        )
+
+    players = get_ordered_session_players(db, session_id)
+
+    if not players:
+        raise HTTPException(
+            status_code=400,
+            detail="Session has no players"
+        )
+
+    current_player = get_current_player(
+        players,
+        game_session.current_player_id
+    )
+
+    if not current_player:
+        raise HTTPException(
+            status_code=400,
+            detail="No current player is active"
+        )
+
+    acting_player = require_current_player_for_action(
+        session=game_session,
+        players=players,
+        player_id=current_player.id
+    )
+
+    if not player_has_all_archon_blueprints(
+        db=db,
+        session_id=session_id,
+        player_id=acting_player.id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"All {ARCHON_BLUEPRINTS_REQUIRED} Archon Blueprints are required to claim the Core"
+        )
+
+    controlled_heart = get_controlled_heart_system(
+        db=db,
+        session_id=session_id,
+        player_id=acting_player.id,
+        requested_system_id=request.system_id
+    )
+
+    if not controlled_heart:
+        raise HTTPException(
+            status_code=400,
+            detail="Current player must control the Heart of the Galaxy / Archive V system"
+        )
+
+    _, heart_system = controlled_heart
+
+    if acting_player.command_points_left < ARCHON_CORE_CLAIM_COMMAND_POINT_COST:
+        raise HTTPException(
+            status_code=400,
+            detail="Current player has no command points left"
+        )
+
+    action_round = game_session.current_round
+
+    core_claim = SessionArchonCoreClaim(
+        session_id=session_id,
+        player_id=acting_player.id,
+        core_system_id=heart_system.id,
+        claimed_round=action_round
+    )
+    db.add(core_claim)
+
+    acting_player.command_points_left -= ARCHON_CORE_CLAIM_COMMAND_POINT_COST
+    if acting_player.command_points_left <= 0:
+        acting_player.has_passed = True
+
+    game_session.status = ARCHON_CORE_SESSION_STATUS
+    game_session.round_phase = ARCHON_CORE_SESSION_STATUS
+    game_session.current_player_id = acting_player.id
+
+    for index, player in enumerate(players):
+        if player.id == acting_player.id:
+            game_session.current_turn_index = index
+            break
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="archon_core_claimed",
+        actor=acting_player,
+        payload={
+            "system_id": heart_system.id,
+            "system_name": heart_system.name,
+            "blueprints_required": ARCHON_BLUEPRINTS_REQUIRED,
+            "command_points_cost": ARCHON_CORE_CLAIM_COMMAND_POINT_COST,
+            "archon_player_id": acting_player.id,
+            "archon_player_faction": acting_player.faction_name,
+            "resistance_player_ids": [
+                player.id
+                for player in players
+                if player.id != acting_player.id
+            ],
+        },
+        round_number=action_round
+    )
+
+    db.commit()
+
+    return {
+        "message": "Archon Core claimed",
+        "session": get_full_session(session_id, db),
+        "archon_core_claim": serialize_archon_core_claim(
+            db=db,
+            claim=get_archon_core_claim(
+                db=db,
+                session_id=session_id
+            )
+        )
+    }
+
+
+@router.get("/{session_id}/technologies")
+def get_session_technologies(
+    session_id: int,
+    db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    players = get_ordered_session_players(db, session_id)
+
+    return {
+        "session_id": session_id,
+        "catalog": [
+            serialize_technology(technology)
+            for technology in TECHNOLOGY_CATALOG
+        ],
+        "players": [
+            {
+                "session_player_id": player.id,
+                "technologies": get_player_technologies_response(
+                    db=db,
+                    session_id=session_id,
+                    player_id=player.id
+                ),
+                "dominance_points": get_player_dominance_points(
+                    db=db,
+                    session_id=session_id,
+                    player_id=player.id
+                ),
+            }
+            for player in players
+        ],
+    }
+
+
+@router.post("/{session_id}/technologies/research")
+def research_technology(
+    session_id: int,
+    request: TechnologyResearchRequest,
+    db: Session = Depends(get_db)
+):
+    game_session = db.query(GameSession).filter(
+        GameSession.id == session_id
+    ).first()
+
+    if not game_session:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found"
+        )
+
+    if game_session.status != "started":
+        raise HTTPException(
+            status_code=400,
+            detail="Technology can only be researched in a started session"
+        )
+
+    technology = TECHNOLOGY_BY_KEY.get(request.technology_key)
+
+    if not technology:
+        raise HTTPException(
+            status_code=404,
+            detail="Technology not found"
+        )
+
+    players = get_ordered_session_players(db, session_id)
+
+    if not players:
+        raise HTTPException(
+            status_code=400,
+            detail="Session has no players"
+        )
+
+    current_player = get_current_player(
+        players,
+        game_session.current_player_id
+    )
+
+    if not current_player:
+        raise HTTPException(
+            status_code=400,
+            detail="No current player is active"
+        )
+
+    acting_player = require_current_player_for_action(
+        session=game_session,
+        players=players,
+        player_id=current_player.id
+    )
+
+    researched_keys = get_researched_technology_keys(
+        db=db,
+        session_id=session_id,
+        player_id=acting_player.id
+    )
+
+    if request.technology_key in researched_keys:
+        raise HTTPException(
+            status_code=409,
+            detail="Technology already researched"
+        )
+
+    if not player_has_required_building(
+        db=db,
+        session_id=session_id,
+        player_id=acting_player.id,
+        building_type=technology["building_type"]
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Requires {technology['building_name']} controlled by "
+                "the current player"
+            )
+        )
+
+    shortage_message = get_technology_shortage_message(
+        player=acting_player,
+        cost=technology["cost"]
+    )
+
+    if shortage_message:
+        raise HTTPException(
+            status_code=400,
+            detail=shortage_message
+        )
+
+    apply_technology_cost(acting_player, technology["cost"])
+
+    action_round = game_session.current_round
+
+    researched_technology = SessionPlayerTechnology(
+        session_id=session_id,
+        player_id=acting_player.id,
+        technology_key=technology["key"],
+        researched_round=action_round
+    )
+    db.add(researched_technology)
+
+    create_game_log(
+        db=db,
+        session=game_session,
+        event_type="technology_researched",
+        actor=acting_player,
+        payload={
+            "technology": serialize_technology(technology),
+            "cost": technology["cost"],
+            "dominance_points": technology["dominance_points"],
+        },
+        round_number=action_round
+    )
+
+    consume_command_point_and_advance_turn(
+        session=game_session,
+        players=players,
+        acting_player=acting_player,
+        db=db
+    )
+
+    db.commit()
+
+    return {
+        "message": "Technology researched",
+        "session": get_full_session(session_id, db)
     }
 
 
